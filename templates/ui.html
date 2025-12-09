@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Secure Config Server</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fomantic-ui@2.9.3/dist/semantic.min.css">
+  <style>
+    body {
+      background-color: #1b1c1d;
+      color: #f9fafb;
+      padding: 2rem;
+    }
+    .ui.menu {
+      background-color: #111 !important;
+      border-radius: 0 !important;
+    }
+    .ui.menu .item,
+    .ui.menu .item > * {
+      color: #f9fafb !important;
+    }
+    .ui.segment {
+      background-color: #27292a !important;
+      color: #f9fafb !important;
+    }
+    .ui.segment * {
+      color: #f9fafb !important;
+    }
+    a,
+    a:visited {
+      color: #21ba45;
+    }
+    code {
+      background: #111;
+      color: #f8f8f2;
+      padding: 2px 4px;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+  </style>
+</head>
+<body>
+  <div class="ui inverted menu">
+    <div class="header item">
+      Secure Config Server
+    </div>
+    <div class="item">
+      <i class="git icon"></i> __REPO_URL__
+    </div>
+    <div class="item">
+      <i class="code branch icon"></i> __BRANCH__
+    </div>
+  </div>
+
+  <div class="ui raised very padded text container segment">
+    <h2 class="ui inverted header">Secure Config Server</h2>
+    <p>This instance is running with the following configuration repository:</p>
+    <div class="ui list">
+      <div class="item">
+        <i class="git icon"></i>
+        <div class="content">
+          <div class="header">Repository URL</div>
+          <div class="description">__REPO_URL__</div>
+        </div>
+      </div>
+      <div class="item">
+        <i class="code branch icon"></i>
+        <div class="content">
+          <div class="header">Branch</div>
+          <div class="description">__BRANCH__</div>
+        </div>
+      </div>
+      <div class="item">
+        <i class="folder open outline icon"></i>
+        <div class="content">
+          <div class="header">Workdir</div>
+          <div class="description">__WORKDIR__</div>
+        </div>
+      </div>
+      <div class="item">
+        <i class="sitemap icon"></i>
+        <div class="content">
+          <div class="header">Subpath</div>
+          <div class="description">__SUBPATH__</div>
+        </div>
+      </div>
+      <div class="item">
+        <i class="hashtag icon"></i>
+        <div class="content">
+          <div class="header">Commit hash</div>
+          <div class="description">__SHA__</div>
+        </div>
+      </div>
+      <div class="item">
+        <i class="clock outline icon"></i>
+        <div class="content">
+          <div class="header">Commit date</div>
+          <div class="description">__COMMIT_DATE__</div>
+        </div>
+      </div>
+    </div>
+
+    <h3 class="ui inverted header">Routes</h3>
+    <ul>
+      <li>
+        <code>/{ application }/{ profile }/{ label }</code> -
+        Spring-compatible JSON environment
+      </li>
+      <li>
+        <code>/file/{ label }/path/to/file.ext</code> -
+        arbitrary file (TEXT → templating via <code>{{ VAR }}</code>)
+      </li>
+      <li>
+        <code>/ui</code> - this UI
+      </li>
+    </ul>
+
+    <p>
+      Authentication: BasicAuth with
+      <code>AUTH_USERNAME</code> /
+      <code>AUTH_PASSWORD</code>.
+    </p>
+  </div>
+</body>
+</html>
