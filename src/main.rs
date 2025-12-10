@@ -149,6 +149,7 @@ struct AppState {
     http: HttpConfig,
     envs: HashMap<String, EnvState>,
     auth: AuthConfig,
+    startup_time: chrono::DateTime<Utc>,
 }
 
 /// ---------- Errors ----------
@@ -258,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http: root_cfg.http.clone(),
         envs,
         auth,
+        startup_time: Utc::now(),
     });
 
     let app = build_router(state.clone());
@@ -1046,6 +1048,133 @@ async fn handle_file_request(
 
 /// ---------- UI handler & router ----------
 
+/// ---------- Health endpoints ----------
+
+#[derive(Serialize)]
+struct HealthStatus {
+    status: &'static str,
+    startup_time: String,
+}
+
+#[derive(Serialize)]
+struct EnvHealthSummary {
+    env: String,
+    env_var_count: usize,
+    file_count: usize,
+}
+
+#[derive(Serialize)]
+struct EnvHealthDetail {
+    status: &'static str,
+    startup_time: String,
+    env: String,
+    env_var_count: usize,
+    file_count: usize,
+}
+
+#[derive(Serialize)]
+struct EnvHealthList {
+    status: &'static str,
+    startup_time: String,
+    environments: Vec<EnvHealthSummary>,
+}
+
+/// Count regular files in the working tree for the given environment (excluding .git).
+fn count_files_for_env(env_state: &EnvState) -> usize {
+    let root = if let Some(sub) = &env_state.git.subpath {
+        env_state.git.workdir.join(sub)
+    } else {
+        env_state.git.workdir.clone()
+    };
+
+    let mut count = 0usize;
+    let mut stack = vec![root];
+
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry_res in entries {
+                if let Ok(entry) = entry_res {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if name == ".git" {
+                                continue;
+                            }
+                        }
+                        stack.push(path);
+                    } else if path.is_file() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    count
+}
+
+async fn healthz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let ts = state
+        .startup_time
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    let body = HealthStatus {
+        status: "UP",
+        startup_time: ts,
+    };
+
+    (StatusCode::OK, Json(body))
+}
+
+async fn healthz_env_all_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let ts = state
+        .startup_time
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    let mut envs_vec = Vec::new();
+    for env_state in state.envs.values() {
+        envs_vec.push(EnvHealthSummary {
+            env: env_state.name.clone(),
+            env_var_count: env_state.env_map.len(),
+            file_count: count_files_for_env(env_state),
+        });
+    }
+
+    let body = EnvHealthList {
+        status: "UP",
+        startup_time: ts,
+        environments: envs_vec,
+    };
+
+    (StatusCode::OK, Json(body))
+}
+
+async fn healthz_env_single_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(env): AxumPath<String>,
+) -> impl IntoResponse {
+    let env_state = match state.envs.get(&env) {
+        Some(e) => e,
+        None => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    let ts = state
+        .startup_time
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    let body = EnvHealthDetail {
+        status: "UP",
+        startup_time: ts,
+        env: env_state.name.clone(),
+        env_var_count: env_state.env_map.len(),
+        file_count: count_files_for_env(env_state),
+    };
+
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 async fn ui_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !check_basic_auth(&state, &headers) {
         return unauthorized_response();
@@ -1130,6 +1259,11 @@ fn build_router(state: Arc<AppState>) -> Router {
     let base_path = normalize_base_path(&state.http.base_path);
 
     let inner = Router::new()
+        // Health endpoints (no auth, good for k8s probes)
+        .route("/healthz", get(healthz_handler))
+        .route("/helthz", get(healthz_handler)) // alias for typo-friendly access
+        .route("/healthz/env", get(healthz_env_all_handler))
+        .route("/healthz/env/{env}", get(healthz_env_single_handler))
         // Spring-compatible: /{env}/{application}/{profile}/{label}
         .route(
             "/{env}/{application}/{profile}/{label}",
