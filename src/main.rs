@@ -38,7 +38,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "secure-config-server",
+    name = "simple-config-server",
     version,
     about = "Secure, template-aware config server (Spring Cloud Config compatible)"
 )]

@@ -1,5 +1,5 @@
 [package]
-name = "secure-config-server"
+name = "simple-config-server"
 version = "0.2.3"
 edition = "2024"
 
