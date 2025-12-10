@@ -504,10 +504,10 @@ Click a file to preview its content after template expansion.</pre>
     function previewFile(env, relPath) {
       const base = apiBase();
       const envName = encodeURIComponent(env.name);
-      const label = encodeURIComponent(env.branch || "main");
       const path = encodeURIComponent(relPath);
 
-      const url = `${base}/${envName}/file/${label}/${path}`;
+      // Uses the REST-ish files endpoint: /{env}/files/{path}
+      const url = `${base}/${envName}/files/${path}`;
 
       fetch(url)
         .then((r) => r.text())

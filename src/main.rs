@@ -992,7 +992,7 @@ async fn file_handler(
         }
     };
 
-    match handle_file_request(env_state, &label, &rel_path).await {
+    match handle_file_request(env_state, Some(&label), &rel_path).await {
         Ok(resp) => resp,
         Err(ServerError::NotFound) => {
             let path = format!("/{}/file/{}/{}", env, label, rel_path);
@@ -1005,13 +1005,44 @@ async fn file_handler(
     }
 }
 
+
+async fn env_file_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((env, rel_path)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_basic_auth(&state, &headers) {
+        return unauthorized_response();
+    }
+
+    let env_state = match state.envs.get(&env) {
+        Some(e) => e,
+        None => {
+            // For non-existing environment, return plain 404 JSON similar to spring 404 style,
+            // but specific to this REST-ish files endpoint.
+            return (StatusCode::NOT_FOUND, "Environment not found").into_response();
+        }
+    };
+
+    match handle_file_request(env_state, None, &rel_path).await {
+        Ok(resp) => resp,
+        Err(ServerError::NotFound) => {
+            (StatusCode::NOT_FOUND, "File not found").into_response()
+        }
+        Err(e) => {
+            error!("[files] error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+        }
+    }
+}
+
 async fn handle_file_request(
     env_state: &EnvState,
-    label: &str,
+    label: Option<&str>,
     rel_path: &str,
 ) -> Result<Response, ServerError> {
     let safe_rel = validate_rel_path(rel_path)?;
-    let bytes_opt = read_file_from_git(&env_state.git, Some(label), &safe_rel).await?;
+    let bytes_opt = read_file_from_git(&env_state.git, label, &safe_rel).await?;
     let bytes = match bytes_opt {
         Some(b) => b,
         None => return Err(ServerError::NotFound),
@@ -1264,6 +1295,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/helthz", get(healthz_handler)) // alias for typo-friendly access
         .route("/healthz/env", get(healthz_env_all_handler))
         .route("/healthz/env/{env}", get(healthz_env_single_handler))
+        // File listing & raw file access with templating for non-Spring clients
+        .route("/{env}/files", get(env_files_handler))
+        .route("/{env}/files/{*path}", get(env_file_handler))
+        // Raw file access with explicit label (advanced):
+        // /{env}/file/{label}/{*path}
+        .route("/{env}/file/{label}/{*path}", get(file_handler))
         // Spring-compatible: /{env}/{application}/{profile}/{label}
         .route(
             "/{env}/{application}/{profile}/{label}",
@@ -1274,12 +1311,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/{env}/{application}/{profile}",
             get(spring_handler_no_label),
         )
-        // Raw file access with templating: /{env}/file/{label}/{*path}
-        .route("/{env}/file/{label}/{*path}", get(file_handler))
         // Env helpers
         .route("/{env}/env", get(env_json_handler))
         .route("/{env}/env/export", get(env_export_handler))
-        .route("/{env}/files", get(env_files_handler))
         // UI
         .route("/ui", get(ui_handler));
 
