@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use axum::extract::OriginalUri;
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State},
@@ -14,11 +15,13 @@ use axum::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use mime_guess::MimeGuess;
 use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
+use serde_json::{Number as JsonNumber, Value as JsonValue};
 use serde_yaml_ng::Value as YamlValue;
 use thiserror::Error;
 use tokio::{net::TcpListener, process::Command, time};
@@ -113,6 +116,14 @@ enum ServerError {
 
     #[error("Bad request: {0}")]
     BadRequest(String),
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    timestamp: String,
+    status: u16,
+    error: String,
+    path: String,
 }
 
 // Regex pro {{ VAR_NAME }} templating
@@ -290,6 +301,21 @@ fn validate_rel_path(rel: &str) -> Result<PathBuf, ServerError> {
     Ok(cleaned)
 }
 
+async fn spring_like_404(OriginalUri(uri): OriginalUri) -> (StatusCode, Json<ErrorResponse>) {
+    let now = Utc::now();
+    // ISO-8601 s milisekundami a offsetem, jako Spring:
+    let timestamp = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    let body = ErrorResponse {
+        timestamp,
+        status: StatusCode::NOT_FOUND.as_u16(),
+        error: "Not Found".to_string(),
+        path: uri.path().to_string(),
+    };
+
+    (StatusCode::NOT_FOUND, Json(body))
+}
+
 /// Handler pro file endpoint: GET /file/{label}/{path...}
 async fn file_handler(
     State(state): State<Arc<AppState>>,
@@ -360,7 +386,7 @@ async fn handle_file_request(
 #[derive(Serialize)]
 struct SpringPropertySource {
     name: String,
-    source: HashMap<String, String>,
+    source: HashMap<String, JsonValue>,
 }
 
 #[derive(Serialize)]
@@ -576,7 +602,7 @@ async fn read_and_merge_yaml_files(
     profiles: &[String],
     label_opt: Option<&str>,
     env_map: &HashMap<String, String>,
-) -> Result<(HashMap<String, String>, bool), ServerError> {
+) -> Result<(HashMap<String, JsonValue>, bool), ServerError> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     // 1) application.yml / application.yaml
     candidates.push(PathBuf::from("application.yml"));
@@ -592,7 +618,7 @@ async fn read_and_merge_yaml_files(
         candidates.push(PathBuf::from(format!("{application}-{p}.yaml")));
     }
 
-    let mut result: HashMap<String, String> = HashMap::new();
+    let mut result: HashMap<String, JsonValue> = HashMap::new();
     let mut found_any = false;
 
     for rel in candidates {
@@ -610,50 +636,76 @@ async fn read_and_merge_yaml_files(
 }
 
 /// Flatten YamlValue do "key -> string" stylu (spring.datasource.url ...).
-fn flatten_yaml_value(prefix: Option<&str>, value: &YamlValue, out: &mut HashMap<String, String>) {
+fn flatten_yaml_value(
+    prefix: Option<&str>,
+    value: &YamlValue,
+    out: &mut HashMap<String, JsonValue>,
+) {
     match value {
+        YamlValue::Null => {
+            if let Some(key) = prefix {
+                out.insert(key.to_string(), JsonValue::Null);
+            }
+        }
+        YamlValue::Bool(b) => {
+            if let Some(key) = prefix {
+                out.insert(key.to_string(), JsonValue::Bool(*b));
+            }
+        }
+        YamlValue::Number(n) => {
+            if let Some(key) = prefix {
+                let json_num = if let Some(i) = n.as_i64() {
+                    JsonNumber::from(i)
+                } else if let Some(u) = n.as_u64() {
+                    JsonNumber::from(u)
+                } else if let Some(f) = n.as_f64() {
+                    // from_f64 může vrátit None pro NaN/Inf → fallback na string
+                    if let Some(num) = JsonNumber::from_f64(f) {
+                        num
+                    } else {
+                        out.insert(key.to_string(), JsonValue::String(n.to_string()));
+                        return;
+                    }
+                } else {
+                    out.insert(key.to_string(), JsonValue::String(n.to_string()));
+                    return;
+                };
+
+                out.insert(key.to_string(), JsonValue::Number(json_num));
+            }
+        }
+        YamlValue::String(s) => {
+            if let Some(key) = prefix {
+                out.insert(key.to_string(), JsonValue::String(s.clone()));
+            }
+        }
+        YamlValue::Sequence(seq) => {
+            for (idx, item) in seq.iter().enumerate() {
+                let new_prefix = match prefix {
+                    Some(p) => format!("{}[{}]", p, idx),
+                    None => idx.to_string(),
+                };
+                flatten_yaml_value(Some(&new_prefix), item, out);
+            }
+        }
         YamlValue::Mapping(map) => {
             for (k, v) in map {
                 let key_str = match k {
                     YamlValue::String(s) => s.clone(),
-                    _ => continue, // klíče musí být string
+                    _ => format!("{:?}", k), // fallback
                 };
+
                 let new_prefix = match prefix {
-                    Some(p) if !p.is_empty() => format!("{p}.{key_str}"),
-                    _ => key_str,
+                    Some(p) => format!("{}.{}", p, key_str),
+                    None => key_str,
                 };
+
                 flatten_yaml_value(Some(&new_prefix), v, out);
             }
         }
-        YamlValue::Sequence(seq) => {
-            for (idx, v) in seq.iter().enumerate() {
-                let key = match prefix {
-                    Some(p) if !p.is_empty() => format!("{p}[{idx}]"),
-                    _ => format!("[{idx}]"),
-                };
-                flatten_yaml_value(Some(&key), v, out);
-            }
-        }
-        YamlValue::Null => {
-            // ignorujeme
-        }
-        YamlValue::Bool(b) => {
-            if let Some(p) = prefix {
-                out.insert(p.to_string(), b.to_string());
-            }
-        }
-        YamlValue::Number(n) => {
-            if let Some(p) = prefix {
-                out.insert(p.to_string(), n.to_string());
-            }
-        }
-        YamlValue::String(s) => {
-            if let Some(p) = prefix {
-                out.insert(p.to_string(), s.clone());
-            }
-        }
-        _ => {
-            // Tagged a případné další varianty prostě ignorujeme
+        YamlValue::Tagged(inner) => {
+            // prostě ignorujeme tag a flattenujeme vnitřní hodnotu
+            flatten_yaml_value(prefix, &inner.value, out);
         }
     }
 }
@@ -756,7 +808,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Router::new().nest(&bp, inner)
     };
 
-    let app = app.with_state(Arc::clone(&state));
+    let app = app.with_state(Arc::clone(&state)).fallback(spring_like_404);
 
     let addr: SocketAddr = config.http.bind_addr.parse()?;
     info!("[main] Listening on http://{}", addr);
