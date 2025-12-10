@@ -2,124 +2,453 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Secure Config Server</title>
+  <title>Secure Config Server UI</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fomantic-ui@2.9.3/dist/semantic.min.css">
+
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/fomantic-ui@2.9.3/dist/semantic.min.css"
+  />
+  <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fomantic-ui@2.9.3/dist/semantic.min.js"></script>
+
   <style>
     body {
-      background-color: #1b1c1d;
-      color: #f9fafb;
+      background-color: #111;
+      color: #f5f5f5;
       padding: 2rem;
     }
-    .ui.menu {
-      background-color: #111 !important;
-      border-radius: 0 !important;
+
+    .ui.inverted.segment {
+      background: #1b1c1d !important;
     }
-    .ui.menu .item,
-    .ui.menu .item > * {
-      color: #f9fafb !important;
+
+    /* všechny nadpisy v invertovaných segmentech */
+    .ui.inverted.segment .ui.header,
+    .ui.inverted.segment h2,
+    .ui.inverted.segment h3,
+    .ui.inverted.segment h4 {
+      color: #f5f5f5 !important;
     }
-    .ui.segment {
-      background-color: #27292a !important;
-      color: #f9fafb !important;
+
+    pre {
+      background: #1b1c1d;
+      color: #f5f5f5;
+      padding: 1rem;
+      border-radius: 0.5rem;
+      overflow-x: auto;
+      font-size: 0.9rem;
     }
-    .ui.segment * {
-      color: #f9fafb !important;
+
+    .env-menu .item.active {
+      background-color: #00b5ad !important;
     }
-    a,
-    a:visited {
+
+    a.file-link {
       color: #21ba45;
+      cursor: pointer;
     }
-    code {
-      background: #111;
-      color: #f8f8f2;
-      padding: 2px 4px;
-      border-radius: 4px;
-      font-size: 0.9em;
+
+    a.file-link:hover {
+      text-decoration: underline;
+    }
+
+    .files-container {
+      max-height: 260px;
+      overflow-y: auto;
+    }
+
+    /* ikonová buňka v tabulce Selected environment */
+    #selected-env-table td.icon-cell {
+      width: 2.5rem;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    #selected-env-table td.icon-cell i {
+      color: #f5f5f5;
+      opacity: 0.85;
+    }
+
+    #selected-env-table td.icon-cell i:hover {
+      opacity: 1;
+    }
+
+    /* hodnotová buňka – nechceme přetékání (Repo URL, Workdir, ...) */
+    #selected-env-table td.value-cell {
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+
+    /* seznam souborů – bez bulletů, s vlastní ikonou */
+    #files-list {
+      list-style-type: none;
+      padding-left: 0;
+      margin-left: 0;
+      color: #f5f5f5;
+    }
+
+    #files-list li {
+      display: flex;
+      align-items: center;
+      margin-bottom: 0.3rem;
+      color: #f5f5f5 !important;
+    }
+
+    #files-list li i.file-icon {
+      margin-right: 0.5rem;
+      color: #f5f5f5;
+      opacity: 0.85;
+    }
+
+    #files-list li i.file-icon:hover {
+      opacity: 1;
+    }
+
+    /* header uvnitř segmentu + copy ikonka */
+    .segment-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.5rem;
+    }
+
+    .copy-button {
+      color: #f5f5f5;
+      opacity: 0.7;
+      cursor: pointer;
+    }
+
+    .copy-button:hover {
+      opacity: 1;
     }
   </style>
 </head>
 <body>
-  <div class="ui inverted menu">
-    <div class="header item">
-      Secure Config Server
-    </div>
-    <div class="item">
-      <i class="git icon"></i> __REPO_URL__
-    </div>
-    <div class="item">
-      <i class="code branch icon"></i> __BRANCH__
-    </div>
-  </div>
-
-  <div class="ui raised very padded text container segment">
+  <div class="ui inverted segment">
     <h2 class="ui inverted header">Secure Config Server</h2>
-    <p>This instance is running with the following configuration repository:</p>
-    <div class="ui list">
-      <div class="item">
-        <i class="git icon"></i>
-        <div class="content">
-          <div class="header">Repository URL</div>
-          <div class="description">__REPO_URL__</div>
-        </div>
-      </div>
-      <div class="item">
-        <i class="code branch icon"></i>
-        <div class="content">
-          <div class="header">Branch</div>
-          <div class="description">__BRANCH__</div>
-        </div>
-      </div>
-      <div class="item">
-        <i class="folder open outline icon"></i>
-        <div class="content">
-          <div class="header">Workdir</div>
-          <div class="description">__WORKDIR__</div>
-        </div>
-      </div>
-      <div class="item">
-        <i class="sitemap icon"></i>
-        <div class="content">
-          <div class="header">Subpath</div>
-          <div class="description">__SUBPATH__</div>
-        </div>
-      </div>
-      <div class="item">
-        <i class="hashtag icon"></i>
-        <div class="content">
-          <div class="header">Commit hash</div>
-          <div class="description">__SHA__</div>
-        </div>
-      </div>
-      <div class="item">
-        <i class="clock outline icon"></i>
-        <div class="content">
-          <div class="header">Commit date</div>
-          <div class="description">__COMMIT_DATE__</div>
-        </div>
-      </div>
-    </div>
-
-    <h3 class="ui inverted header">Routes</h3>
-    <ul>
-      <li>
-        <code>/{ application }/{ profile }/{ label }</code> -
-        Spring-compatible JSON environment
-      </li>
-      <li>
-        <code>/file/{ label }/path/to/file.ext</code> -
-        arbitrary file (TEXT → templating via <code>{{ VAR }}</code>)
-      </li>
-      <li>
-        <code>/ui</code> - this UI
-      </li>
-    </ul>
-
     <p>
-      Authentication: BasicAuth with
-      <code>AUTH_USERNAME</code> /
-      <code>AUTH_PASSWORD</code>.
+      Multi-environment configuration server compatible with Spring Cloud Config,
+      with template expansion over environment variables.
     </p>
   </div>
+
+  <div id="main-content" class="ui grid">
+    <!-- left column: env list + selected env -->
+    <div class="four wide column">
+      <div class="ui inverted segment">
+        <h3 class="ui header">Environments</h3>
+        <div id="env-list" class="ui inverted vertical menu env-menu"></div>
+      </div>
+
+      <div class="ui inverted segment">
+        <h3 class="ui header">Selected environment</h3>
+        <table
+          id="selected-env-table"
+          class="ui very basic inverted compact table"
+        >
+          <tbody>
+            <tr>
+              <td class="icon-cell">
+                <i
+                  class="id badge outline icon"
+                  title="Environment name"
+                ></i>
+              </td>
+              <td class="value-cell" id="env-name"></td>
+            </tr>
+            <tr>
+              <td class="icon-cell">
+                <i
+                  class="linkify icon"
+                  title="Repository URL"
+                ></i>
+              </td>
+              <td class="value-cell" id="env-repo"></td>
+            </tr>
+            <tr>
+              <td class="icon-cell">
+                <i
+                  class="code branch icon"
+                  title="Git branch"
+                ></i>
+              </td>
+              <td class="value-cell" id="env-branch"></td>
+            </tr>
+            <tr>
+              <td class="icon-cell">
+                <i
+                  class="folder open outline icon"
+                  title="Git subpath"
+                ></i>
+              </td>
+              <td class="value-cell" id="env-subpath"></td>
+            </tr>
+            <tr>
+              <td class="icon-cell">
+                <i
+                  class="terminal icon"
+                  title="Working directory"
+                ></i>
+              </td>
+              <td class="value-cell" id="env-workdir"></td>
+            </tr>
+            <tr>
+              <td class="icon-cell">
+                <i
+                  class="hashtag icon"
+                  title="Last commit hash"
+                ></i>
+              </td>
+              <td class="value-cell" id="env-last-commit"></td>
+            </tr>
+            <tr>
+              <td class="icon-cell">
+                <i
+                  class="clock outline icon"
+                  title="Last commit date"
+                ></i>
+              </td>
+              <td class="value-cell" id="env-last-commit-date"></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- right column: env vars + files -->
+    <div class="twelve wide column">
+      <div class="ui inverted segment">
+        <div class="segment-header">
+          <h3 class="ui header">Environment variables (JSON)</h3>
+          <i
+            class="copy icon copy-button"
+            title="Copy JSON to clipboard"
+            onclick="copyPre('env-json')"
+          ></i>
+        </div>
+        <pre id="env-json">Select environment…</pre>
+      </div>
+
+      <div class="ui inverted segment">
+        <div class="segment-header">
+          <h3 class="ui header">Environment variables as shell exports</h3>
+          <i
+            class="copy icon copy-button"
+            title="Copy exports to clipboard"
+            onclick="copyPre('env-export')"
+          ></i>
+        </div>
+        <pre id="env-export">Select environment…</pre>
+      </div>
+
+      <div class="ui inverted segment">
+        <div class="segment-header">
+          <h3 class="ui header">Files &amp; templated preview (git repo)</h3>
+          <i
+            class="copy icon copy-button"
+            title="Copy preview to clipboard"
+            onclick="copyPre('file-preview')"
+          ></i>
+        </div>
+
+        <div class="ui two column stackable grid">
+          <div class="six wide column">
+            <h4 class="ui header">Files</h4>
+            <div class="files-container">
+              <ul id="files-list" class="ui list">
+                <li>No environment selected.</li>
+              </ul>
+            </div>
+          </div>
+          <div class="ten wide column">
+            <h4 class="ui header">Preview (templated text)</h4>
+            <pre id="file-preview">
+Click a file to preview its content after template expansion.</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Filled in by the server: UiMeta { base_path, environments[] }
+    const META = __META_JSON__;
+
+    function apiBase() {
+      if (!META || !META.base_path) return "";
+      return META.base_path === "/" ? "" : META.base_path;
+    }
+
+    function byEnvName(name) {
+      return META.environments.find((e) => e.name === name);
+    }
+
+    let currentEnv =
+      META && META.environments && META.environments.length > 0
+        ? META.environments[0].name
+        : null;
+
+    function renderEnvList() {
+      const container = document.getElementById("env-list");
+      container.innerHTML = "";
+
+      META.environments.forEach((env) => {
+        const item = document.createElement("a");
+        item.className = "item" + (env.name === currentEnv ? " active" : "");
+        item.textContent = env.name;
+        item.onclick = () => {
+          currentEnv = env.name;
+          renderEnvList();
+          renderEnvDetails();
+          loadEnvPanels();
+        };
+        container.appendChild(item);
+      });
+    }
+
+    function renderEnvDetails() {
+      const env = byEnvName(currentEnv);
+      if (!env) {
+        return;
+      }
+
+      document.getElementById("env-name").textContent = env.name;
+      document.getElementById("env-repo").textContent = env.repo_url;
+      document.getElementById("env-branch").textContent = env.branch;
+      document.getElementById("env-subpath").textContent = env.subpath || "";
+      document.getElementById("env-workdir").textContent = env.workdir;
+      document.getElementById("env-last-commit").textContent =
+        env.last_commit || "";
+      document.getElementById("env-last-commit-date").textContent =
+        env.last_commit_date || "";
+    }
+
+    async function loadEnvPanels() {
+      const env = byEnvName(currentEnv);
+      if (!env) return;
+
+      const base = apiBase();
+      const envName = encodeURIComponent(env.name);
+
+      // /{env}/env
+      fetch(`${base}/${envName}/env`)
+        .then((r) => (r.ok ? r.json() : Promise.reject(r)))
+        .then((data) => {
+          document.getElementById("env-json").textContent = JSON.stringify(
+            data,
+            null,
+            2
+          );
+        })
+        .catch(() => {
+          document.getElementById("env-json").textContent =
+            "Failed to load environment variables.";
+        });
+
+      // /{env}/env/export
+      fetch(`${base}/${envName}/env/export`)
+        .then((r) => (r.ok ? r.text() : Promise.reject(r)))
+        .then((text) => {
+          document.getElementById("env-export").textContent = text;
+        })
+        .catch(() => {
+          document.getElementById("env-export").textContent =
+            "Failed to load export view.";
+        });
+
+      // /{env}/files
+      fetch(`${base}/${envName}/files`)
+        .then((r) => (r.ok ? r.json() : Promise.reject(r)))
+        .then((data) => {
+          const files = (data && data.files) || [];
+          const listEl = document.getElementById("files-list");
+          listEl.innerHTML = "";
+          if (files.length === 0) {
+            const li = document.createElement("li");
+            li.textContent = "No files found in this environment.";
+            listEl.appendChild(li);
+            return;
+          }
+
+          files.forEach((f) => {
+            const li = document.createElement("li");
+
+            const icon = document.createElement("i");
+            icon.className = "file outline icon file-icon";
+            icon.title = "Config file";
+            li.appendChild(icon);
+
+            const a = document.createElement("a");
+            a.className = "file-link";
+            a.textContent = f;
+            a.href = "javascript:void(0)";
+            a.onclick = () => previewFile(env, f);
+            li.appendChild(a);
+
+            listEl.appendChild(li);
+          });
+        })
+        .catch(() => {
+          document.getElementById("files-list").innerHTML =
+            "<li>Failed to list files.</li>";
+        });
+    }
+
+    function previewFile(env, relPath) {
+      const base = apiBase();
+      const envName = encodeURIComponent(env.name);
+      const label = encodeURIComponent(env.branch || "main");
+      const path = encodeURIComponent(relPath);
+
+      const url = `${base}/${envName}/file/${label}/${path}`;
+
+      fetch(url)
+        .then((r) => r.text())
+        .then((text) => {
+          document.getElementById("file-preview").textContent = text;
+        })
+        .catch(() => {
+          document.getElementById("file-preview").textContent =
+            "Failed to load file.";
+        });
+    }
+
+    // univerzální copy helper pro <pre> bloky
+    function copyPre(id) {
+      const pre = document.getElementById(id);
+      if (!pre) return;
+      const text = pre.textContent || "";
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => {});
+      } else {
+        // fallback pro starší browsery
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+        } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      if (!META || !META.environments || META.environments.length === 0) {
+        document.getElementById("main-content").innerHTML =
+          "<p>No environments configured in config.yaml.</p>";
+        return;
+      }
+
+      renderEnvList();
+      renderEnvDetails();
+      loadEnvPanels();
+    });
+  </script>
 </body>
 </html>
