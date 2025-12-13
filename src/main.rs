@@ -631,43 +631,85 @@ fn flatten_yaml_value(
     }
 }
 
+/// Načte YAML soubory podle spring-like konvence a vrátí je jako seznam
+/// SpringPropertySource (jeden soubor = jeden propertySource).
+/// Pořadí v seznamu odpovídá Springu: vyšší precedence je dříve v seznamu.
 async fn read_and_merge_yaml_files(
     git: &GitConfig,
     application: &str,
     profiles: &[String],
     label_opt: Option<&str>,
     env_map: &HashMap<String, String>,
-) -> Result<(HashMap<String, JsonValue>, bool), ServerError> {
+) -> Result<(Vec<SpringPropertySource>, bool), ServerError> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    // 1) application.yml / application.yaml
-    candidates.push(PathBuf::from("application.yml"));
-    candidates.push(PathBuf::from("application.yaml"));
-    // 2) <application>.yml / <application>.yaml
-    candidates.push(PathBuf::from(format!("{application}.yml")));
-    candidates.push(PathBuf::from(format!("{application}.yaml")));
-    // 3) profile-specific
+    // Spring-like precedence (nejvyšší první):
+    //  1) {application}-{profile}.yml / .yaml
+    //  2) application-{profile}.yml / .yaml
+    //  3) {application}.yml / .yaml
+    //  4) application.yml / application.yaml
+
+    // 1) {application}-{profile}.yml / .yaml
     for p in profiles {
-        candidates.push(PathBuf::from(format!("application-{p}.yml")));
-        candidates.push(PathBuf::from(format!("application-{p}.yaml")));
         candidates.push(PathBuf::from(format!("{application}-{p}.yml")));
         candidates.push(PathBuf::from(format!("{application}-{p}.yaml")));
     }
 
-    let mut result: HashMap<String, JsonValue> = HashMap::new();
+    // 2) application-{profile}.yml / .yaml
+    for p in profiles {
+        candidates.push(PathBuf::from(format!("application-{p}.yml")));
+        candidates.push(PathBuf::from(format!("application-{p}.yaml")));
+    }
+
+    // 3) {application}.yml / .yaml
+    candidates.push(PathBuf::from(format!("{application}.yml")));
+    candidates.push(PathBuf::from(format!("{application}.yaml")));
+
+    // 4) application.yml / application.yaml
+    candidates.push(PathBuf::from("application.yml"));
+    candidates.push(PathBuf::from("application.yaml"));
+
+    let mut property_sources: Vec<SpringPropertySource> = Vec::new();
     let mut found_any = false;
 
     for rel in candidates {
         if let Some(bytes) = read_file_from_git(git, label_opt, &rel).await? {
             found_any = true;
+
             let content = String::from_utf8(bytes)?;
             let templated = apply_template(&content, env_map);
             let yaml: YamlValue = serde_yaml_ng::from_str(&templated)?;
-            flatten_yaml_value(None, &yaml, &mut result);
+
+            // Zploštíme YAML do mapy key -> JsonValue pro *tento* soubor
+            let mut flat: HashMap<String, JsonValue> = HashMap::new();
+            flatten_yaml_value(None, &yaml, &mut flat);
+
+            // Jméno property source ve stylu Springu:
+            // <repo_url>/<subpath>/<relativní_cesta_souboru>
+            let mut rel_with_subpath = PathBuf::new();
+            if let Some(sub) = &git.subpath {
+                rel_with_subpath.push(sub);
+            }
+            rel_with_subpath.push(&rel);
+
+            let rel_str = rel_with_subpath
+                .components()
+                .fold(String::new(), |mut acc, c| {
+                    if !acc.is_empty() {
+                        acc.push('/');
+                    }
+                    acc.push_str(&c.as_os_str().to_string_lossy());
+                    acc
+                });
+
+            let base = git.repo_url.trim_end_matches('/');
+            let name = format!("{}/{}", base, rel_str);
+
+            property_sources.push(SpringPropertySource { name, source: flat });
         }
     }
 
-    Ok((result, found_any))
+    Ok((property_sources, found_any))
 }
 
 fn parse_profiles(profile_str: &str) -> Vec<String> {
@@ -730,7 +772,9 @@ async fn handle_spring_request(
     label_opt: Option<&str>,
 ) -> Result<SpringEnvResponse, ServerError> {
     let profiles = parse_profiles(profile_str);
-    let (props, found_any) = read_and_merge_yaml_files(
+
+    // Teď dostaneme rovnou seznam SpringPropertySource po jednotlivých souborech
+    let (property_sources, _found_any) = read_and_merge_yaml_files(
         &env_state.git,
         application,
         &profiles,
@@ -739,32 +783,13 @@ async fn handle_spring_request(
     )
     .await?;
 
+    // Git commit hash (version) - pro daný label / branch
     let version = match git_version_for_label(&env_state.git, label_opt).await {
         Ok(v) => v,
         Err(e) => {
             warn!("[spring] git version lookup failed: {:?}", e);
             String::new()
         }
-    };
-
-    let property_sources = if found_any {
-        let ps_name = format!(
-            "git:{}{}:{}",
-            env_state.git.repo_url,
-            env_state
-                .git
-                .subpath
-                .as_ref()
-                .map(|p| format!("/{}", p.display()))
-                .unwrap_or_default(),
-            profile_str
-        );
-        vec![SpringPropertySource {
-            name: ps_name,
-            source: props,
-        }]
-    } else {
-        Vec::new()
     };
 
     Ok(SpringEnvResponse {
@@ -1005,7 +1030,6 @@ async fn file_handler(
     }
 }
 
-
 async fn env_file_handler(
     State(state): State<Arc<AppState>>,
     AxumPath((env, rel_path)): AxumPath<(String, String)>,
@@ -1026,9 +1050,7 @@ async fn env_file_handler(
 
     match handle_file_request(env_state, None, &rel_path).await {
         Ok(resp) => resp,
-        Err(ServerError::NotFound) => {
-            (StatusCode::NOT_FOUND, "File not found").into_response()
-        }
+        Err(ServerError::NotFound) => (StatusCode::NOT_FOUND, "File not found").into_response(),
         Err(e) => {
             error!("[files] error: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
