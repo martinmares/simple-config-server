@@ -19,6 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{SecondsFormat, Utc};
 use clap::Parser;
+use indexmap::IndexMap;
 use mime_guess::MimeGuess;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -569,7 +570,7 @@ fn apply_template(input: &str, env: &HashMap<String, String>) -> String {
 fn flatten_yaml_value(
     prefix: Option<&str>,
     value: &YamlValue,
-    out: &mut HashMap<String, JsonValue>,
+    out: &mut IndexMap<String, JsonValue>,
 ) {
     match value {
         YamlValue::Null => {
@@ -681,7 +682,7 @@ async fn read_and_merge_yaml_files(
             let yaml: YamlValue = serde_yaml_ng::from_str(&templated)?;
 
             // Zploštíme YAML do mapy key -> JsonValue pro *tento* soubor
-            let mut flat: HashMap<String, JsonValue> = HashMap::new();
+            let mut flat: IndexMap<String, JsonValue> = IndexMap::new();
             flatten_yaml_value(None, &yaml, &mut flat);
 
             // Jméno property source ve stylu Springu:
@@ -750,7 +751,7 @@ fn validate_rel_path(raw: &str) -> Result<PathBuf, ServerError> {
 #[derive(Serialize)]
 struct SpringPropertySource {
     name: String,
-    source: HashMap<String, JsonValue>,
+    source: IndexMap<String, JsonValue>,
 }
 
 #[derive(Serialize)]
