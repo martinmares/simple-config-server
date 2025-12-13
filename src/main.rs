@@ -85,11 +85,11 @@ impl GitConfig {
             self.branches.insert(0, self.branch.clone());
         } else {
             // Move existing default branch to the front if it's not already
-            if let Some(pos) = self.branches.iter().position(|b| b == &self.branch) {
-                if pos != 0 {
-                    let val = self.branches.remove(pos);
-                    self.branches.insert(0, val);
-                }
+            if let Some(pos) = self.branches.iter().position(|b| b == &self.branch)
+                && pos != 0
+            {
+                let val = self.branches.remove(pos);
+                self.branches.insert(0, val);
             }
         }
     }
@@ -328,7 +328,6 @@ enum ServerError {
 }
 
 /// ---------- Global template regex & UI template ----------
-
 static TEMPLATE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"#).unwrap());
 
@@ -442,7 +441,6 @@ fn init_tracing() {
 }
 
 /// ---------- Config helpers ----------
-
 fn load_root_config(path: &Path) -> Result<RootConfig, ServerError> {
     let contents = std::fs::read_to_string(path)?;
     let cfg: RootConfig = serde_yaml_ng::from_str(&contents)?;
@@ -482,7 +480,6 @@ fn normalize_base_path(base: &str) -> String {
 }
 
 /// ---------- Git helpers ----------
-
 async fn sync_git_repo(git: &GitConfig) -> Result<(), ServerError> {
     std::fs::create_dir_all(&git.workdir)?;
     let git_dir = git.workdir.join(".git");
@@ -714,8 +711,6 @@ async fn list_files_in_git(git: &GitConfig) -> Result<Vec<String>, ServerError> 
         if let Some(ref subpath) = sub {
             if let Some(stripped) = rel.strip_prefix(&(subpath.clone() + "/")) {
                 rel = stripped.to_string();
-            } else if rel == *subpath {
-                continue;
             } else {
                 continue;
             }
@@ -727,7 +722,6 @@ async fn list_files_in_git(git: &GitConfig) -> Result<Vec<String>, ServerError> 
 }
 
 /// ---------- Template & YAML helpers ----------
-
 fn apply_template(input: &str, env: &HashMap<String, String>) -> String {
     TEMPLATE_RE
         .replace_all(input, |caps: &regex::Captures| {
@@ -977,9 +971,9 @@ async fn handle_spring_request(
 
 #[derive(Clone, Copy)]
 enum AuthScope {
-    ConfigRead,
-    FilesRead,
-    EnvRead,
+    Config,
+    Files,
+    Env,
 }
 
 /// Basic-auth check only (no fallback semantics)
@@ -1027,9 +1021,9 @@ fn client_has_env(client: &ClientIdClient, env: Option<&str>) -> bool {
 
 fn client_has_scope(client: &ClientIdClient, scope: AuthScope) -> bool {
     let needed = match scope {
-        AuthScope::ConfigRead => "config:read",
-        AuthScope::FilesRead => "files:read",
-        AuthScope::EnvRead => "env:read",
+        AuthScope::Config => "config:read",
+        AuthScope::Files => "files:read",
+        AuthScope::Env => "env:read",
     };
     client.scopes.iter().any(|s| s == needed)
 }
@@ -1056,23 +1050,23 @@ fn is_authorized_for(
     }
 
     // 2) X-Client-Id
-    if client_enabled {
-        if let Some(client) = client_auth.get_client(headers) {
-            if !client_has_env(client, env) {
-                return false;
-            }
+    if client_enabled
+        && let Some(client) = client_auth.get_client(headers)
+    {
+        if !client_has_env(client, env) {
+            return false;
+        }
 
-            match scope {
-                // UI access
-                None => {
-                    if client.ui_access {
-                        return true;
-                    }
+        match scope {
+            // UI access
+            None => {
+                if client.ui_access {
+                    return true;
                 }
-                Some(s) => {
-                    if client_has_scope(client, s) {
-                        return true;
-                    }
+            }
+            Some(s) => {
+                if client_has_scope(client, s) {
+                    return true;
                 }
             }
         }
@@ -1106,13 +1100,12 @@ async fn spring_like_404(OriginalUri(uri): OriginalUri) -> Response {
 }
 
 /// ---------- HTTP handlers ----------
-
 async fn spring_handler(
     State(state): State<Arc<AppState>>,
     AxumPath((env, application, profile, label)): AxumPath<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::ConfigRead)) {
+    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Config)) {
         return unauthorized_response();
     }
 
@@ -1138,7 +1131,7 @@ async fn spring_handler_no_label(
     AxumPath((env, application, profile)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::ConfigRead)) {
+    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Config)) {
         return unauthorized_response();
     }
 
@@ -1171,7 +1164,7 @@ async fn env_json_handler(
     AxumPath(env): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::EnvRead)) {
+    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Env)) {
         return unauthorized_response();
     }
 
@@ -1191,7 +1184,7 @@ async fn env_export_handler(
     AxumPath(env): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::EnvRead)) {
+    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Env)) {
         return unauthorized_response();
     }
 
@@ -1223,7 +1216,7 @@ async fn env_files_handler(
     AxumPath(env): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::FilesRead)) {
+    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Files)) {
         return unauthorized_response();
     }
 
@@ -1249,7 +1242,7 @@ async fn env_file_handler(
     AxumPath((env, rel_path)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::FilesRead)) {
+    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Files)) {
         return unauthorized_response();
     }
 
@@ -1300,7 +1293,7 @@ async fn handle_file_request(
         None => return Err(ServerError::NotFound),
     };
 
-    let is_binary = bytes.iter().any(|b| *b == 0) || std::str::from_utf8(&bytes).is_err();
+    let is_binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
 
     if is_binary {
         let mime = MimeGuess::from_path(&safe_rel)
@@ -1330,7 +1323,6 @@ async fn handle_file_request(
 }
 
 /// ---------- UI handler & router ----------
-
 /// ---------- Health endpoints ----------
 
 #[derive(Serialize)]
@@ -1375,19 +1367,17 @@ fn count_files_for_env(env_state: &EnvState) -> usize {
 
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry_res in entries {
-                if let Ok(entry) = entry_res {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name == ".git" {
-                                continue;
-                            }
-                        }
-                        stack.push(path);
-                    } else if path.is_file() {
-                        count += 1;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && name == ".git"
+                    {
+                        continue;
                     }
+                    stack.push(path);
+                } else if path.is_file() {
+                    count += 1;
                 }
             }
         }
