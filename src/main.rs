@@ -2342,3 +2342,195 @@ fn build_router(state: Arc<AppState>) -> Router {
 
     app.with_state(state).fallback(spring_like_404)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn simple_issuer() -> BearerIssuer {
+        BearerIssuer {
+            name: "simple-idm-jwt".to_string(),
+            kind: BearerIssuerKind::SimpleIdmJwt,
+            issuer: "https://sso.example.com".to_string(),
+            audience: Some("simple-config-server".to_string()),
+            jwks_url: "https://sso.example.com/.well-known/jwks.json".to_string(),
+            jwks: HashMap::new(),
+        }
+    }
+
+    fn kube_issuer() -> BearerIssuer {
+        BearerIssuer {
+            name: "kube-sa-jwt".to_string(),
+            kind: BearerIssuerKind::KubeSaJwt,
+            issuer: "https://openshift.example.com".to_string(),
+            audience: Some("simple-config-server".to_string()),
+            jwks_url: "https://openshift.example.com/openid/v1/jwks".to_string(),
+            jwks: HashMap::new(),
+        }
+    }
+
+    fn claims(groups: Vec<&str>, scope: Option<&str>) -> JwtClaims {
+        JwtClaims {
+            sub: Some("user-1".to_string()),
+            iss: Some("https://sso.example.com".to_string()),
+            aud: Some(serde_json::json!("simple-config-server")),
+            exp: 123,
+            scope: scope.map(str::to_string),
+            client_id: None,
+            email: Some("mares@example.com".to_string()),
+            preferred_username: Some("mares".to_string()),
+            groups: Some(JwtGroups::Many(
+                groups.into_iter().map(str::to_string).collect(),
+            )),
+            kubernetes: None,
+        }
+    }
+
+    fn kube_claims(namespace: &str, service_account: &str, subject: &str) -> JwtClaims {
+        JwtClaims {
+            sub: Some(subject.to_string()),
+            iss: Some("https://openshift.example.com".to_string()),
+            aud: Some(serde_json::json!("simple-config-server")),
+            exp: 123,
+            scope: Some("config:read files:read".to_string()),
+            client_id: None,
+            email: None,
+            preferred_username: None,
+            groups: Some(JwtGroups::Many(vec![
+                "simple-config:tenant:o2".to_string(),
+                "simple-config:env:test".to_string(),
+            ])),
+            kubernetes: Some(KubernetesClaims {
+                namespace: Some(namespace.to_string()),
+                serviceaccount: Some(KubernetesServiceAccountClaims {
+                    name: Some(service_account.to_string()),
+                }),
+                pod: Some(KubernetesPodClaims {
+                    name: Some("order-api-abc".to_string()),
+                    uid: Some("pod-uid".to_string()),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_requires_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-groups", "simple-config:role:admin".parse().unwrap());
+
+        assert!(!trusted_proxy_authorized(
+            &headers,
+            Some("o2"),
+            Some("test"),
+            Some(AuthScope::Config),
+        ));
+    }
+
+    #[test]
+    fn trusted_proxy_allows_tenant_env_scope_match() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-user", "mares".parse().unwrap());
+        headers.insert(
+            "x-auth-groups",
+            "simple-config:tenant:o2,simple-config:env:test,simple-config:scope:config:read"
+                .parse()
+                .unwrap(),
+        );
+
+        assert!(trusted_proxy_authorized(
+            &headers,
+            Some("o2"),
+            Some("test"),
+            Some(AuthScope::Config),
+        ));
+        assert!(!trusted_proxy_authorized(
+            &headers,
+            Some("o2"),
+            Some("prod"),
+            Some(AuthScope::Config),
+        ));
+    }
+
+    #[test]
+    fn bearer_claims_allow_tenant_env_and_oauth_scope() {
+        let claims = claims(
+            vec!["simple-config:tenant:o2", "simple-config:env:test"],
+            Some("config:read"),
+        );
+
+        assert!(claims_authorized(
+            &simple_issuer(),
+            &claims,
+            Some("o2"),
+            Some("test"),
+            Some(AuthScope::Config),
+        ));
+        assert!(!claims_authorized(
+            &simple_issuer(),
+            &claims,
+            Some("o2"),
+            Some("test"),
+            Some(AuthScope::Files),
+        ));
+    }
+
+    #[test]
+    fn bearer_claims_admin_bypasses_tenant_env_scope() {
+        let claims = claims(vec!["simple-config:role:admin"], None);
+
+        assert!(claims_authorized(
+            &simple_issuer(),
+            &claims,
+            Some("other"),
+            Some("prod"),
+            Some(AuthScope::Files),
+        ));
+    }
+
+    #[test]
+    fn kube_service_account_claims_must_match_subject() {
+        let ok_claims = kube_claims(
+            "zis-test",
+            "order-api",
+            "system:serviceaccount:zis-test:order-api",
+        );
+        let bad_claims = kube_claims(
+            "zis-prod",
+            "order-api",
+            "system:serviceaccount:zis-test:order-api",
+        );
+
+        assert!(claims_authorized(
+            &kube_issuer(),
+            &ok_claims,
+            Some("o2"),
+            Some("test"),
+            Some(AuthScope::Config),
+        ));
+        assert!(!claims_authorized(
+            &kube_issuer(),
+            &bad_claims,
+            Some("o2"),
+            Some("test"),
+            Some(AuthScope::Config),
+        ));
+    }
+
+    #[test]
+    fn client_id_auth_checks_tenant_env_and_scope() {
+        let client = ClientIdClient {
+            id: "ci".to_string(),
+            tenants: vec!["o2".to_string()],
+            environments: vec!["test".to_string()],
+            scopes: vec!["config:read".to_string()],
+            ui_access: false,
+        };
+
+        assert!(client_has_tenant(&client, Some("o2")));
+        assert!(!client_has_tenant(&client, Some("cetin")));
+        assert!(client_has_env(&client, Some("test")));
+        assert!(!client_has_env(&client, Some("prod")));
+        assert!(client_has_scope(&client, AuthScope::Config));
+        assert!(!client_has_scope(&client, AuthScope::Files));
+    }
+}
