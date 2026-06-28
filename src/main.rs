@@ -10,13 +10,11 @@ use axum::{
     extract::{OriginalUri, Path as AxumPath, State},
     http::{
         HeaderMap, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, WWW_AUTHENTICATE},
+        header::{AUTHORIZATION, CONTENT_TYPE},
     },
     response::{Html, IntoResponse, Response},
     routing::get,
 };
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use indexmap::IndexMap;
@@ -115,53 +113,8 @@ fn default_base_path() -> String {
     "/".to_string()
 }
 
-/// Root configuration supports:
-/// - single instance: `git` + optional global env
-/// - multi-tenant: `environments` + optional global env
-#[derive(Debug, Clone, Deserialize, Default)]
-struct ClientIdClientConfig {
-    /// Public identifier passed in the header (e.g. "x-client-id")
-    id: String,
-    /// Optional human readable description
-    #[serde(default)]
-    #[allow(dead_code)]
-    description: Option<String>,
-    /// Allowed tenants, e.g. ["acme"] or ["*"] for all
-    #[serde(default)]
-    tenants: Vec<String>,
-    /// Allowed environments, e.g. ["dev", "test"] or ["*"] for all
-    #[serde(default)]
-    environments: Vec<String>,
-    /// Granted scopes, e.g. ["config:read", "files:read"]
-    #[serde(default)]
-    scopes: Vec<String>,
-    /// Whether this client may access the HTML UI
-    #[serde(default)]
-    ui_access: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct ClientIdAuthConfig {
-    /// Turn on header based auth
-    #[serde(default)]
-    enabled: bool,
-    /// Header name to read the client id from (default "x-client-id")
-    #[serde(default = "default_client_id_header_name")]
-    header_name: String,
-    /// List of allowed clients
-    #[serde(default)]
-    clients: Vec<ClientIdClientConfig>,
-}
-
-fn default_client_id_header_name() -> String {
-    "x-client-id".to_string()
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 struct RootAuthConfig {
-    /// Configuration for X-Client-Id style auth
-    #[serde(default)]
-    client_id: ClientIdAuthConfig,
     /// Trust X-Auth-* headers from a protected reverse proxy
     #[serde(default)]
     trusted_proxy: TrustedProxyAuthConfig,
@@ -279,22 +232,6 @@ struct EnvState {
 }
 
 #[derive(Clone)]
-struct ClientIdClient {
-    id: String,
-    tenants: Vec<String>,
-    environments: Vec<String>,
-    scopes: Vec<String>,
-    ui_access: bool,
-}
-
-#[derive(Clone)]
-struct ClientIdAuth {
-    enabled: bool,
-    header_name: HeaderName,
-    clients: HashMap<String, ClientIdClient>,
-}
-
-#[derive(Clone)]
 struct BearerAuth {
     enabled: bool,
     issuers: Arc<RwLock<Vec<BearerIssuer>>>,
@@ -323,65 +260,6 @@ impl BearerIssuerKind {
             "kube-sa-jwt" => Some(Self::KubeSaJwt),
             _ => None,
         }
-    }
-}
-
-impl ClientIdAuth {
-    fn from_config(cfg: &ClientIdAuthConfig) -> Self {
-        let mut clients_map = HashMap::new();
-
-        for c in &cfg.clients {
-            let envs = if c.environments.is_empty() {
-                vec!["*".to_string()]
-            } else {
-                c.environments.clone()
-            };
-            let tenants = if c.tenants.is_empty() {
-                vec!["*".to_string()]
-            } else {
-                c.tenants.clone()
-            };
-
-            let client = ClientIdClient {
-                id: c.id.clone(),
-                tenants,
-                environments: envs,
-                scopes: c.scopes.clone(),
-                ui_access: c.ui_access,
-            };
-
-            clients_map.insert(client.id.clone(), client);
-        }
-
-        let header_name = HeaderName::from_bytes(cfg.header_name.as_bytes())
-            .unwrap_or(HeaderName::from_static("x-client-id"));
-
-        if cfg.enabled {
-            info!(
-                "[auth] X-Client-Id auth enabled ({} clients, header={})",
-                clients_map.len(),
-                header_name.as_str()
-            );
-        } else if !clients_map.is_empty() {
-            warn!("[auth] X-Client-Id clients configured but auth.client_id.enabled=false");
-        } else {
-            info!("[auth] X-Client-Id auth disabled");
-        }
-
-        Self {
-            enabled: cfg.enabled,
-            header_name,
-            clients: clients_map,
-        }
-    }
-
-    fn get_client<'a>(&'a self, headers: &'a HeaderMap) -> Option<&'a ClientIdClient> {
-        if !self.enabled {
-            return None;
-        }
-        let value = headers.get(&self.header_name)?;
-        let id = value.to_str().ok()?;
-        self.clients.get(id)
     }
 }
 
@@ -495,12 +373,6 @@ impl BearerAuth {
 
 #[derive(Clone)]
 struct AuthConfig {
-    /// Whether basic auth is required (AUTH_USERNAME/PASSWORD set)
-    required: bool,
-    username: String,
-    password: String,
-    /// Optional X-Client-Id based auth
-    client_id: ClientIdAuth,
     /// Optional trusted proxy X-Auth-* based auth
     trusted_proxy_enabled: bool,
     /// Optional Authorization: Bearer JWT auth
@@ -509,21 +381,6 @@ struct AuthConfig {
 
 impl AuthConfig {
     async fn from_env_and_config(auth_cfg: &RootAuthConfig) -> Result<Self, ServerError> {
-        let user = std::env::var("AUTH_USERNAME").ok();
-        let pass = std::env::var("AUTH_PASSWORD").ok();
-
-        let (required, username, password) = match (user, pass) {
-            (Some(u), Some(p)) => {
-                info!("[auth] Basic auth enabled");
-                (true, u, p)
-            }
-            _ => {
-                warn!("[auth] Basic auth disabled (env AUTH_USERNAME / AUTH_PASSWORD not set)");
-                (false, String::new(), String::new())
-            }
-        };
-
-        let client_id = ClientIdAuth::from_config(&auth_cfg.client_id);
         if auth_cfg.trusted_proxy.enabled {
             info!("[auth] trusted proxy X-Auth-* headers enabled");
         } else {
@@ -532,10 +389,6 @@ impl AuthConfig {
         let bearer = BearerAuth::from_config(&auth_cfg.bearer).await?;
 
         Ok(Self {
-            required,
-            username,
-            password,
-            client_id,
             trusted_proxy_enabled: auth_cfg.trusted_proxy.enabled,
             bearer,
         })
@@ -1323,70 +1176,6 @@ enum JwtGroups {
     Many(Vec<String>),
 }
 
-/// Basic-auth check only (no fallback semantics)
-fn check_basic_auth_only(state: &AppState, headers: &HeaderMap) -> bool {
-    let value = match headers.get(AUTHORIZATION) {
-        Some(v) => v,
-        None => return false,
-    };
-
-    let value_str = match value.to_str() {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    if !value_str.starts_with("Basic ") {
-        return false;
-    }
-
-    let b64 = &value_str[6..];
-    let decoded = match BASE64_STANDARD.decode(b64) {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-
-    let creds = String::from_utf8_lossy(&decoded);
-    let mut parts = creds.splitn(2, ':');
-    let user = parts.next().unwrap_or("");
-    let pass = parts.next().unwrap_or("");
-
-    user == state.auth.username && pass == state.auth.password
-}
-
-fn client_has_env(client: &ClientIdClient, env: Option<&str>) -> bool {
-    match env {
-        None => true,
-        Some(e) => {
-            if client.environments.iter().any(|v| v == "*") {
-                true
-            } else {
-                client.environments.iter().any(|v| v == e)
-            }
-        }
-    }
-}
-
-fn client_has_tenant(client: &ClientIdClient, tenant: Option<&str>) -> bool {
-    match tenant {
-        None => true,
-        Some(t) => {
-            if client.tenants.iter().any(|v| v == "*") {
-                true
-            } else {
-                client.tenants.iter().any(|v| v == t)
-            }
-        }
-    }
-}
-
-fn client_has_scope(client: &ClientIdClient, scope: AuthScope) -> bool {
-    let needed = match scope {
-        AuthScope::Config => "config:read",
-        AuthScope::Files => "files:read",
-    };
-    client.scopes.iter().any(|s| s == needed)
-}
-
 fn jwt_groups_to_vec(groups: JwtGroups) -> Vec<String> {
     match groups {
         JwtGroups::One(value) => vec![value],
@@ -1666,7 +1455,7 @@ fn trusted_proxy_authorized(
     }
 }
 
-/// Combined authorization for basic + X-Client-Id + trusted proxy headers
+/// Combined authorization for Bearer JWT + trusted proxy headers.
 async fn is_authorized_for(
     state: &AppState,
     headers: &HeaderMap,
@@ -1674,49 +1463,14 @@ async fn is_authorized_for(
     env: Option<&str>,
     scope: Option<AuthScope>,
 ) -> bool {
-    let basic_enabled = state.auth.required;
-    let client_auth = &state.auth.client_id;
-    let client_enabled = client_auth.enabled;
     let proxy_enabled = state.auth.trusted_proxy_enabled;
-    let bearer_enabled = state.auth.bearer.enabled;
 
-    // No auth configured at all -> open access (backwards compatible)
-    if !basic_enabled && !client_enabled && !proxy_enabled && !bearer_enabled {
-        return true;
-    }
-
-    // 1) Basic auth
-    if basic_enabled && check_basic_auth_only(state, headers) {
-        return true;
-    }
-
-    // 2) Bearer JWT
+    // 1) Bearer JWT
     if bearer_authorized(&state.auth.bearer, headers, tenant, env, scope).await {
         return true;
     }
 
-    // 3) X-Client-Id
-    if client_enabled && let Some(client) = client_auth.get_client(headers) {
-        if !client_has_tenant(client, tenant) || !client_has_env(client, env) {
-            return false;
-        }
-
-        match scope {
-            // UI access
-            None => {
-                if client.ui_access {
-                    return true;
-                }
-            }
-            Some(s) => {
-                if client_has_scope(client, s) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // 4) Trusted proxy X-Auth-* headers
+    // 2) Trusted proxy X-Auth-* headers
     if proxy_enabled && trusted_proxy_authorized(headers, tenant, env, scope) {
         return true;
     }
@@ -1727,10 +1481,6 @@ async fn is_authorized_for(
 fn unauthorized_response() -> Response {
     let mut resp = Response::new("Unauthorized".into());
     *resp.status_mut() = StatusCode::UNAUTHORIZED;
-    resp.headers_mut().insert(
-        WWW_AUTHENTICATE,
-        r#"Basic realm="SecureConfigServer""#.parse().unwrap(),
-    );
     resp
 }
 
@@ -2265,7 +2015,7 @@ async fn ui_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     let meta = UiMeta {
         base_path,
         environments: envs_meta,
-        auth_enabled: state.auth.required || state.auth.client_id.enabled,
+        auth_enabled: state.auth.bearer.enabled || state.auth.trusted_proxy_enabled,
     };
 
     let meta_json = match serde_json::to_string(&meta) {
@@ -2514,23 +2264,5 @@ mod tests {
             Some("test"),
             Some(AuthScope::Config),
         ));
-    }
-
-    #[test]
-    fn client_id_auth_checks_tenant_env_and_scope() {
-        let client = ClientIdClient {
-            id: "ci".to_string(),
-            tenants: vec!["o2".to_string()],
-            environments: vec!["test".to_string()],
-            scopes: vec!["config:read".to_string()],
-            ui_access: false,
-        };
-
-        assert!(client_has_tenant(&client, Some("o2")));
-        assert!(!client_has_tenant(&client, Some("cetin")));
-        assert!(client_has_env(&client, Some("test")));
-        assert!(!client_has_env(&client, Some("prod")));
-        assert!(client_has_scope(&client, AuthScope::Config));
-        assert!(!client_has_scope(&client, AuthScope::Files));
     }
 }

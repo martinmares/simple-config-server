@@ -5,7 +5,7 @@ A small Rust service that behaves like a **read‑only Spring Cloud Config Serve
 * multi‑tenant environments (`dev`, `test`, `ref`, `prod`, …),
 * templating of text files using environment variables (`{{ VAR_NAME }}`),
 * lightweight HTML UI for inspection and debugging,
-* optional **HTTP Basic Auth** and **`X-Client-Id` header based auth**,
+* **Bearer JWT** and optional trusted proxy header authentication,
 * additional endpoints for non‑Spring clients (raw assets).
 
 It is designed to run inside Kubernetes, but works equally well as a simple binary on your laptop.
@@ -56,22 +56,19 @@ server:
 env_from_process: true          # take current process env as a base map
 env_file: "/app/config/global.env"
 
-# optional auth config (Basic + X-Client-Id)
+# auth config
 auth:
-  client_id:
+  bearer:
     enabled: true
-    header_name: "x-client-id"
-    clients:
-      - id: "ci"
-        description: "CI pipeline"
-        environments: ["dev", "test"]      # or ["*"] for all envs
-        scopes: ["config:read", "files:read"]
-        ui_access: false
-      - id: "ops"
-        description: "Ops dashboards"
-        environments: ["*"]
-        scopes: ["config:read", "files:read"]
-        ui_access: true
+    issuers:
+      - name: "simple-idm-jwt"
+        kind: "simple-idm-jwt"
+        issuer: "https://sso.cloud-app.cz"
+        jwks_url: "https://sso.cloud-app.cz/.well-known/jwks.json"
+        audience: "simple-config-server"
+
+  trusted_proxy:
+    enabled: false
 
 # Either single-instance:
 git:
@@ -398,73 +395,15 @@ If `base_path` is `/`, routes are exposed exactly as `/api/v1/tenants/{tenant}/e
 
 ### 6.2 Authentication
 
-There are three ways to protect the server:
+There are two supported authentication mechanisms:
 
-1. **HTTP Basic Auth** via environment variables.
-2. **Header‑based client auth** via `X-Client-Id` (or a custom header) configured in `config.yaml`.
-3. **Trusted proxy headers** via `X-Auth-*` headers from a protected auth proxy.
+1. **Bearer JWT auth** through configured issuers.
+2. **Trusted proxy headers** through `X-Auth-*` headers from a protected auth proxy.
 
-You can turn on any combination, or none.
+At least one auth mode must grant access for application endpoints. Health
+endpoints remain unauthenticated.
 
-#### 6.2.1 Basic Auth (env vars)
-
-If you set:
-
-```bash
-export AUTH_USERNAME="myuser"
-export AUTH_PASSWORD="mypassword"
-```
-
-then:
-
-* Basic Auth is **required** for all endpoints (including `/ui`).
-* A valid `Authorization: Basic ...` header **always** grants access, regardless of `X-Client-Id`.
-* If credentials are wrong or missing, you get `401` with a `WWW-Authenticate` header.
-
-If one or both env vars are missing:
-
-* Basic Auth is **disabled**.
-
-Credentials are not persisted anywhere; they live only in memory.
-
-#### 6.2.2 X‑Client‑Id auth (per‑client ACL)
-
-Header‑based auth is configured under `auth.client_id` in `config.yaml`:
-
-```yaml
-auth:
-  client_id:
-    enabled: true
-    header_name: "x-client-id"
-    clients:
-      - id: "ci"
-        description: "CI pipeline"
-        environments: ["dev", "test"]        # or ["*"] for all envs
-        scopes: ["config:read", "files:read"]
-        ui_access: false
-      - id: "ops-dashboard"
-        environments: ["*"]
-        scopes: ["config:read", "files:read"]
-        ui_access: true
-```
-
-Semantics:
-
-* If `enabled: false` or no clients are defined:
-  * X‑Client‑Id auth is effectively turned off.
-* If `enabled: true`:
-  * The server looks for the header named `header_name` (default `"x-client-id"`).
-  * If the header value matches a configured client:
-    * `environments` controls which environments the client may access:
-      * `["*"]` → any environment.
-      * otherwise → only listed environment names.
-    * `scopes` control what the client can do:
-      * `config:read` – Spring‑style endpoints (`/api/v1/tenants/{tenant}/envs/{env}/{app}/{profile}…`).
-      * `files:read` – asset endpoints (`/api/v1/tenants/{tenant}/envs/{env}/assets…`).
-    * `ui_access: true` additionally allows access to `/ui`.
-  * If the header is missing or the client is not known, the request is rejected (unless Basic Auth already succeeded or all auth is disabled).
-
-#### 6.2.3 Trusted proxy headers
+#### 6.2.1 Trusted proxy headers
 
 Use this mode only when the server is reachable exclusively through a trusted
 reverse proxy that strips all client-supplied `X-Auth-*` headers before setting
@@ -494,7 +433,7 @@ Supported group conventions:
 * `simple-config:scope:files:read` for asset endpoints.
 * `simple-config:ui` for `/ui` access.
 
-#### 6.2.4 Bearer JWT auth
+#### 6.2.2 Bearer JWT auth
 
 Use this mode for CLI, CI/CD, service-to-service clients, and Kubernetes /
 OpenShift workloads.
@@ -535,16 +474,13 @@ when tenant and environment access is granted through groups.
 For `kube-sa-jwt`, the server validates that the JWT `sub` matches the
 Kubernetes `namespace` and `serviceaccount.name` claims.
 
-#### 6.2.5 Auth precedence & defaults
+#### 6.2.3 Auth precedence & defaults
 
 The authorization logic is:
 
-1. If **no auth mode** is configured → **open access** (backwards compatible).
-2. If Basic Auth is configured and the request has **valid** Basic credentials → **allow**, ignore X‑Client‑Id.
-3. Otherwise, if Bearer JWT auth is enabled and the token grants access → **allow**.
-4. Otherwise, if X‑Client‑Id auth is enabled and the header matches a configured client → check **environment** and **scopes**.
-5. Otherwise, if trusted proxy headers are enabled and `X-Auth-*` grants access → **allow**.
-6. Otherwise → **401 Unauthorized**.
+1. If Bearer JWT auth is enabled and the token grants access → **allow**.
+2. Otherwise, if trusted proxy headers are enabled and `X-Auth-*` grants access → **allow**.
+3. Otherwise → **401 Unauthorized**.
 
 Health endpoints (`/healthz`, `/healthz/env`) are intentionally **not** protected and always return basic status information.
 
@@ -574,10 +510,8 @@ The main preview areas have “copy to clipboard” icons.
 
 Authentication:
 
-* If Basic Auth is configured, `/ui` always requires valid Basic credentials.
-* Otherwise, if X‑Client‑Id auth is enabled:
-  * only clients with `ui_access: true` may access `/ui`.
-* If no auth is configured at all → `/ui` is open.
+* Bearer JWT users need `simple-config:ui` or `simple-config:role:admin`.
+* Trusted proxy users need `simple-config:ui` or `simple-config:role:admin`.
 
 ---
 
