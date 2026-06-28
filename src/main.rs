@@ -114,6 +114,7 @@ fn default_base_path() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RootAuthConfig {
     /// Trust X-Auth-* headers from a protected reverse proxy
     #[serde(default)]
@@ -124,6 +125,7 @@ struct RootAuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct TrustedProxyAuthConfig {
     /// Turn on trusted proxy header auth
     #[serde(default)]
@@ -131,6 +133,7 @@ struct TrustedProxyAuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct BearerAuthConfig {
     /// Turn on Authorization: Bearer JWT auth
     #[serde(default)]
@@ -141,6 +144,7 @@ struct BearerAuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BearerIssuerConfig {
     /// Stable policy-facing name, e.g. simple-idm-jwt or kube-sa-jwt
     name: String,

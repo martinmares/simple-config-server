@@ -400,6 +400,9 @@ There are two supported authentication mechanisms:
 1. **Bearer JWT auth** through configured issuers.
 2. **Trusted proxy headers** through `X-Auth-*` headers from a protected auth proxy.
 
+Legacy Basic Auth and `X-Client-Id` authentication are not supported. If these
+keys are present in `auth:`, configuration loading fails.
+
 At least one auth mode must grant access for application endpoints. Health
 endpoints remain unauthenticated.
 
