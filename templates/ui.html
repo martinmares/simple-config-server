@@ -63,8 +63,7 @@
                 Simple Config Server
               </h2>
 <div class="text-muted">
-                Multi-environment configuration server compatible with Spring Cloud Config,
-                with template expansion over environment variables and Git-backed assets.
+                Multi-environment runtime config and asset server with Spring Cloud Config compatible endpoints.
               </div>
 </div>
 <div class="d-flex align-items-center gap-2 flex-wrap justify-content-end">
@@ -79,10 +78,22 @@
 <span class="badge bg-secondary-lt">
                 reloaded: <span class="font-monospace" id="hero-reloaded-at">-</span>
 </span>
-<label class="form-check form-switch m-0 ms-2">
-<input class="form-check-input" id="theme-toggle" type="checkbox"/>
-<span class="form-check-label">Theme</span>
-</label>
+<div class="nav-item d-none d-md-flex" style="position: relative;">
+<a href="#" class="nav-link px-0" id="theme-toggle" tabindex="-1" aria-label="Přepnout theme">
+<i class="ti ti-sun"></i>
+</a>
+<div id="theme-menu" class="dropdown-menu dropdown-menu-end dropdown-menu-arrow" style="display: none; position: absolute; right: 0; top: 100%;">
+<a href="#" class="dropdown-item" data-theme="light">
+<i class="ti ti-sun me-2"></i> Světlý
+</a>
+<a href="#" class="dropdown-item" data-theme="dark">
+<i class="ti ti-moon me-2"></i> Tmavý
+</a>
+<a href="#" class="dropdown-item" data-theme="auto">
+<i class="ti ti-device-desktop me-2"></i> Auto
+</a>
+</div>
+</div>
 </div>
 </div>
 </div>
@@ -162,36 +173,6 @@
 <div class="col-12">
 <div class="card">
 <div class="card-header">
-<h3 class="card-title">Environment variables (JSON)</h3>
-<div class="card-actions">
-<button class="btn btn-sm btn-icon" onclick="copyPre('env-json')" title="Copy JSON" type="button">
-<i class="ti ti-copy"></i>
-</button>
-</div>
-</div>
-<div class="card-body">
-<pre class="m-0 p-3 border rounded bg-body-tertiary font-monospace overflow-auto text-body" id="env-json" style="max-height: 260px;">Select environment…</pre>
-</div>
-</div>
-</div>
-<div class="col-12">
-<div class="card">
-<div class="card-header">
-<h3 class="card-title">Environment variables as shell exports</h3>
-<div class="card-actions">
-<button class="btn btn-sm btn-icon" onclick="copyPre('env-export')" title="Copy exports" type="button">
-<i class="ti ti-copy"></i>
-</button>
-</div>
-</div>
-<div class="card-body">
-<pre class="m-0 p-3 border rounded bg-body-tertiary font-monospace overflow-auto text-body" id="env-export" style="max-height: 240px;">Select environment…</pre>
-</div>
-</div>
-</div>
-<div class="col-12">
-<div class="card">
-<div class="card-header">
 <h3 class="card-title">Spring config JSON preview</h3>
 <div class="card-actions">
 <button class="btn btn-sm btn-icon" onclick="copyPre('spring-preview')" title="Copy Spring JSON" type="button">
@@ -243,7 +224,7 @@
 <div class="card-body">
 <div class="row g-3">
 <div class="col-12 col-md-4">
-<div class="text-muted mb-2">Files</div>
+<div class="text-muted mb-2">Assets</div>
 <ul class="list-group list-group-flush border rounded overflow-auto" id="files-list" style="max-height: 320px;">
 <li class="list-group-item text-muted">No environment selected.</li>
 </ul>
@@ -269,11 +250,6 @@
 
     // Filled in by the server: UiMeta { base_path, environments[] }
     const META = __META_JSON__;
-
-    function apiBase() {
-      if (!META || !META.base_path) return "";
-      return META.base_path === "/" ? "" : META.base_path;
-    }
 
     function byEnvName(name) {
       return META.environments.find((e) => e.name === name);
@@ -388,43 +364,17 @@
       const env = byEnvName(currentEnv);
       if (!env) return;
 
-      const base = apiBase();
-      const envName = encodeURIComponent(env.name);
+      const apiBase = env.api_base;
 
-      // /{env}/env
-      fetch(`${base}/${envName}/env`)
+      fetch(`${apiBase}/assets`)
         .then((r) => (r.ok ? r.json() : Promise.reject(r)))
         .then((data) => {
-          document.getElementById("env-json").textContent = JSON.stringify(
-            data,
-            null,
-            2
-          );
-        })
-        .catch(() => {
-          document.getElementById("env-json").textContent =
-            "Failed to load environment variables.";
-        });
-
-      // /{env}/env/export
-      fetch(`${base}/${envName}/env/export`)
-        .then((r) => (r.ok ? r.text() : Promise.reject(r)))
-        .then((text) => {
-          document.getElementById("env-export").textContent = text;
-        })
-        .catch(() => {
-          document.getElementById("env-export").textContent =
-            "Failed to load export view.";
-        });
-
-      // /{env}/assets
-      fetch(`${base}/${envName}/assets`)
-        .then((r) => (r.ok ? r.json() : Promise.reject(r)))
-        .then((data) => {
-          const files = (data && data.files) || [];
+          const items = Array.isArray(data && data.items)
+            ? data.items
+            : ((data && data.files) || []).map((path) => ({ path, kind: "file", opaque: false, templated: true }));
           const listEl = document.getElementById("files-list");
           listEl.innerHTML = "";
-          if (files.length === 0) {
+          if (items.length === 0) {
             const li = document.createElement("li");
             li.className = "list-group-item";
             li.textContent = "No files found in this environment.";
@@ -432,21 +382,47 @@
             return;
           }
 
-          files.forEach((f) => {
+          items.forEach((item) => {
             const li = document.createElement("li");
             li.className = "list-group-item d-flex align-items-center";
+            const kind = item.kind;
+            const path = item.path;
 
             const icon = document.createElement("i");
-            icon.className = "ti ti-file-text me-2 text-muted";
-            icon.title = "Config file";
+            if (kind === "assets-secured-bundle") {
+              icon.className = "ti ti-lock me-2 text-muted";
+              icon.title = "secured asset bundle";
+            } else if (kind === "assets-unsecured-bundle") {
+              icon.className = "ti ti-package me-2 text-muted";
+              icon.title = "asset bundle";
+            } else {
+              icon.className = "ti ti-file-text me-2 text-muted";
+              icon.title = "asset file";
+            }
             li.appendChild(icon);
 
             const a = document.createElement("a");
             a.className = "link-primary text-decoration-none";
-            a.textContent = f;
+            a.textContent = path;
             a.href = "#";
-            a.addEventListener("click", (ev) => { ev.preventDefault(); previewFile(env, f); });
+            a.addEventListener("click", (ev) => { ev.preventDefault(); previewFile(env, path); });
             li.appendChild(a);
+
+            if (kind !== "file") {
+              const badge = document.createElement("span");
+              badge.className = "badge ms-2";
+              if (kind === "assets-secured-bundle") {
+                badge.classList.add("bg-azure-lt");
+                badge.textContent = "virtual fs / secured";
+              } else if (kind === "assets-unsecured-bundle") {
+                badge.classList.add("bg-secondary-lt");
+                badge.textContent = "virtual fs";
+              } else {
+                badge.classList.add("bg-secondary-lt");
+                badge.textContent = kind;
+              }
+              li.appendChild(badge);
+            }
 
             listEl.appendChild(li);
           });
@@ -468,20 +444,30 @@
     }
 
     function previewFile(env, relPath) {
-      const base = apiBase();
-      const envName = encodeURIComponent(env.name);
       const path = encodePathPreserveSlashes(relPath);
+      const previewEl = document.getElementById("file-preview");
 
       // Uses the REST-ish assets endpoint: /{env}/assets/{path}
-      const url = `${base}/${envName}/assets/${path}`;
+      const url = `${env.api_base}/assets/${path}`;
 
       fetch(url)
         .then((r) => r.text())
         .then((text) => {
-          document.getElementById("file-preview").textContent = text;
+          if (relPath === "assets.secured.json" || relPath === "assets.unsecured.json") {
+            previewEl.textContent =
+              [
+                "# opaque asset bundle",
+                "# server does not template or decrypt this payload",
+                "# use encjson-rs / bundle export on the client side",
+                "",
+                text,
+              ].join("\n");
+          } else {
+            previewEl.textContent = text;
+          }
         })
         .catch(() => {
-          document.getElementById("file-preview").textContent =
+          previewEl.textContent =
             "Failed to load file.";
         });
     }
@@ -517,9 +503,8 @@
           return;
         }
 
-        const base = apiBase();
-        const envName = encodeURIComponent(env.name);
-        let path = `${base}/${envName}/${encodeURIComponent(app)}/${encodeURIComponent(profile)}`;
+        const apiBase = env.api_base;
+        let path = `${apiBase}/${encodeURIComponent(app)}/${encodeURIComponent(profile)}`;
         if (label) {
           path += `/${encodeURIComponent(label)}`;
         }
@@ -611,7 +596,7 @@
       renderEnvDetails();
 
       if (META.auth_enabled) {
-        // full mode: env JSON, exports, files, preview
+        // full mode: files + Spring preview
         loadEnvPanels();
         setupSpringPreview();
       } else {
@@ -663,27 +648,51 @@
   
   </script>
 <script>
-    // Simple theme toggle (Bootstrap 5.3 / Tabler)
+    // Theme toggle (aligned with Simple Release Management)
     (function () {
-      const key = "simple-config-ui-theme";
-      const root = document.documentElement;
-      const toggle = document.getElementById("theme-toggle");
+      const themeToggle = document.getElementById('theme-toggle');
+      const themeMenu = document.getElementById('theme-menu');
+      const themeButtons = document.querySelectorAll('[data-theme]');
 
-      function setTheme(t) {
-        root.setAttribute("data-bs-theme", t);
+      if (!themeToggle || !themeMenu || themeButtons.length === 0) return;
+
+      themeToggle.addEventListener('click', function (e) {
+        e.preventDefault();
+        const isVisible = themeMenu.style.display === 'block';
+        themeMenu.style.display = isVisible ? 'none' : 'block';
+      });
+
+      document.addEventListener('click', function (e) {
+        if (!themeToggle.contains(e.target) && !themeMenu.contains(e.target)) {
+          themeMenu.style.display = 'none';
+        }
+      });
+
+      function applyTheme(theme) {
+        if (theme === 'auto') {
+          const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          document.documentElement.setAttribute('data-bs-theme', prefersDark ? 'dark' : 'light');
+        } else {
+          document.documentElement.setAttribute('data-bs-theme', theme);
+        }
       }
 
-      const saved = localStorage.getItem(key);
-      const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-      const initial = saved || (prefersDark ? "dark" : "light");
-      setTheme(initial);
+      themeButtons.forEach(button => {
+        button.addEventListener('click', function (e) {
+          e.preventDefault();
+          const theme = this.getAttribute('data-theme');
+          localStorage.setItem('theme', theme);
+          applyTheme(theme);
+          themeMenu.style.display = 'none';
+        });
+      });
 
-      if (toggle) {
-        toggle.checked = initial === "dark";
-        toggle.addEventListener("change", () => {
-          const next = toggle.checked ? "dark" : "light";
-          setTheme(next);
-          localStorage.setItem(key, next);
+      const savedTheme = localStorage.getItem('theme') || 'auto';
+      applyTheme(savedTheme);
+
+      if (savedTheme === 'auto') {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+          document.documentElement.setAttribute('data-bs-theme', e.matches ? 'dark' : 'light');
         });
       }
     })();

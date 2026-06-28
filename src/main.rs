@@ -20,6 +20,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use indexmap::IndexMap;
+use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use mime_guess::MimeGuess;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -30,6 +31,7 @@ use thiserror::Error;
 use tokio::{
     net::TcpListener,
     process::Command,
+    sync::RwLock,
     time::{Duration, sleep},
 };
 use tracing::{error, info, warn};
@@ -96,6 +98,13 @@ impl GitConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct ServerConfig {
+    bind: String,
+    #[serde(default = "default_base_path")]
+    base_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct HttpConfig {
     bind_addr: String,
     #[serde(default = "default_base_path")]
@@ -117,10 +126,13 @@ struct ClientIdClientConfig {
     #[serde(default)]
     #[allow(dead_code)]
     description: Option<String>,
+    /// Allowed tenants, e.g. ["acme"] or ["*"] for all
+    #[serde(default)]
+    tenants: Vec<String>,
     /// Allowed environments, e.g. ["dev", "test"] or ["*"] for all
     #[serde(default)]
     environments: Vec<String>,
-    /// Granted scopes, e.g. ["config:read", "files:read", "env:read"]
+    /// Granted scopes, e.g. ["config:read", "files:read"]
     #[serde(default)]
     scopes: Vec<String>,
     /// Whether this client may access the HTML UI
@@ -150,11 +162,59 @@ struct RootAuthConfig {
     /// Configuration for X-Client-Id style auth
     #[serde(default)]
     client_id: ClientIdAuthConfig,
+    /// Trust X-Auth-* headers from a protected reverse proxy
+    #[serde(default)]
+    trusted_proxy: TrustedProxyAuthConfig,
+    /// Authorization: Bearer JWT auth
+    #[serde(default)]
+    bearer: BearerAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TrustedProxyAuthConfig {
+    /// Turn on trusted proxy header auth
+    #[serde(default)]
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BearerAuthConfig {
+    /// Turn on Authorization: Bearer JWT auth
+    #[serde(default)]
+    enabled: bool,
+    /// Configured trusted JWT issuers
+    #[serde(default)]
+    issuers: Vec<BearerIssuerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BearerIssuerConfig {
+    /// Stable policy-facing name, e.g. simple-idm-jwt or kube-sa-jwt
+    name: String,
+    /// Issuer kind: simple-idm-jwt | kube-sa-jwt
+    kind: String,
+    /// Expected JWT iss claim
+    issuer: String,
+    /// Expected audience. If omitted, aud validation is disabled.
+    #[serde(default)]
+    audience: Option<String>,
+    /// Explicit JWKS URL
+    #[serde(default)]
+    jwks_url: Option<String>,
+    /// OIDC discovery URL used when jwks_url is not set
+    #[serde(default)]
+    discovery_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RootConfig {
-    http: HttpConfig,
+    #[serde(default)]
+    server: Option<ServerConfig>,
+    #[serde(default)]
+    http: Option<HttpConfig>,
+
+    #[serde(default)]
+    tenancy: TenancyConfig,
 
     /// Load process environment into template variables
     #[serde(default)]
@@ -168,13 +228,33 @@ struct RootConfig {
     #[serde(default)]
     git: Option<GitConfig>,
 
-    /// Multi-tenant mode
+    /// Multi-tenant mode (legacy: environments only)
     #[serde(default)]
     environments: HashMap<String, EnvDefinition>,
+
+    /// Multi-tenant mode: tenants -> environments
+    #[serde(default)]
+    tenants: HashMap<String, TenantDefinition>,
 
     /// Authentication / authorization configuration
     #[serde(default)]
     auth: RootAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TenancyConfig {
+    #[serde(default = "default_tenancy_mode")]
+    mode: String, // simple | multi
+    #[serde(default = "default_tenant_name")]
+    default_tenant: String,
+}
+
+fn default_tenancy_mode() -> String {
+    "simple".to_string()
+}
+
+fn default_tenant_name() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,8 +264,15 @@ struct EnvDefinition {
     env_file: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TenantDefinition {
+    #[serde(default)]
+    environments: HashMap<String, EnvDefinition>,
+}
+
 #[derive(Debug, Clone)]
 struct EnvState {
+    tenant: String,
     name: String,
     git: GitConfig,
     env_map: Arc<HashMap<String, String>>,
@@ -194,6 +281,7 @@ struct EnvState {
 #[derive(Clone)]
 struct ClientIdClient {
     id: String,
+    tenants: Vec<String>,
     environments: Vec<String>,
     scopes: Vec<String>,
     ui_access: bool,
@@ -206,6 +294,38 @@ struct ClientIdAuth {
     clients: HashMap<String, ClientIdClient>,
 }
 
+#[derive(Clone)]
+struct BearerAuth {
+    enabled: bool,
+    issuers: Arc<RwLock<Vec<BearerIssuer>>>,
+}
+
+#[derive(Clone)]
+struct BearerIssuer {
+    name: String,
+    kind: BearerIssuerKind,
+    issuer: String,
+    audience: Option<String>,
+    jwks_url: String,
+    jwks: HashMap<String, DecodingKey>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BearerIssuerKind {
+    SimpleIdmJwt,
+    KubeSaJwt,
+}
+
+impl BearerIssuerKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "simple-idm-jwt" => Some(Self::SimpleIdmJwt),
+            "kube-sa-jwt" => Some(Self::KubeSaJwt),
+            _ => None,
+        }
+    }
+}
+
 impl ClientIdAuth {
     fn from_config(cfg: &ClientIdAuthConfig) -> Self {
         let mut clients_map = HashMap::new();
@@ -216,9 +336,15 @@ impl ClientIdAuth {
             } else {
                 c.environments.clone()
             };
+            let tenants = if c.tenants.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                c.tenants.clone()
+            };
 
             let client = ClientIdClient {
                 id: c.id.clone(),
+                tenants,
                 environments: envs,
                 scopes: c.scopes.clone(),
                 ui_access: c.ui_access,
@@ -259,6 +385,114 @@ impl ClientIdAuth {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct OidcDiscoveryDocument {
+    jwks_uri: String,
+}
+
+async fn load_jwks(url: &str) -> Result<HashMap<String, DecodingKey>, ServerError> {
+    let body = reqwest::get(url)
+        .await
+        .map_err(|err| ServerError::Other(format!("failed to load JWKS {url}: {err}")))?
+        .text()
+        .await
+        .map_err(|err| ServerError::Other(format!("failed to read JWKS {url}: {err}")))?;
+    let set: JwkSet = serde_json::from_str(&body)?;
+    let mut map = HashMap::new();
+    for jwk in set.keys {
+        if let Some(kid) = jwk.common.key_id.clone() {
+            let key = DecodingKey::from_jwk(&jwk)
+                .map_err(|err| ServerError::Other(format!("invalid JWKS key {kid}: {err}")))?;
+            map.insert(kid, key);
+        }
+    }
+    Ok(map)
+}
+
+async fn discover_jwks_uri(url: &str) -> Result<String, ServerError> {
+    let body = reqwest::get(url)
+        .await
+        .map_err(|err| ServerError::Other(format!("failed to load OIDC discovery {url}: {err}")))?
+        .text()
+        .await
+        .map_err(|err| ServerError::Other(format!("failed to read OIDC discovery {url}: {err}")))?;
+    let doc: OidcDiscoveryDocument = serde_json::from_str(&body)?;
+    let jwks_uri = doc.jwks_uri.trim();
+    if jwks_uri.is_empty() {
+        return Err(ServerError::Other(format!(
+            "OIDC discovery document {url} has empty jwks_uri"
+        )));
+    }
+    Ok(jwks_uri.to_string())
+}
+
+impl BearerAuth {
+    async fn from_config(cfg: &BearerAuthConfig) -> Result<Self, ServerError> {
+        if !cfg.enabled {
+            info!("[auth] Bearer JWT auth disabled");
+            return Ok(Self {
+                enabled: false,
+                issuers: Arc::new(RwLock::new(Vec::new())),
+            });
+        }
+
+        let mut issuers = Vec::new();
+        for issuer_cfg in &cfg.issuers {
+            let kind = BearerIssuerKind::parse(&issuer_cfg.kind).ok_or_else(|| {
+                ServerError::BadRequest(format!(
+                    "unsupported bearer issuer kind `{}`",
+                    issuer_cfg.kind
+                ))
+            })?;
+            let jwks_url = if let Some(url) = issuer_cfg
+                .jwks_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                url.to_string()
+            } else {
+                let discovery_url = issuer_cfg
+                    .discovery_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}/.well-known/openid-configuration",
+                            issuer_cfg.issuer.trim_end_matches('/')
+                        )
+                    });
+                discover_jwks_uri(&discovery_url).await?
+            };
+            info!(
+                "[auth] loading Bearer issuer {} kind={} issuer={} jwks={}",
+                issuer_cfg.name, issuer_cfg.kind, issuer_cfg.issuer, jwks_url
+            );
+            issuers.push(BearerIssuer {
+                name: issuer_cfg.name.clone(),
+                kind,
+                issuer: issuer_cfg.issuer.clone(),
+                audience: issuer_cfg.audience.clone(),
+                jwks_url: jwks_url.clone(),
+                jwks: load_jwks(&jwks_url).await?,
+            });
+        }
+
+        if issuers.is_empty() {
+            warn!("[auth] Bearer JWT auth enabled but no issuers are configured");
+        } else {
+            info!("[auth] Bearer JWT auth enabled ({} issuers)", issuers.len());
+        }
+
+        Ok(Self {
+            enabled: true,
+            issuers: Arc::new(RwLock::new(issuers)),
+        })
+    }
+}
+
 #[derive(Clone)]
 struct AuthConfig {
     /// Whether basic auth is required (AUTH_USERNAME/PASSWORD set)
@@ -267,10 +501,14 @@ struct AuthConfig {
     password: String,
     /// Optional X-Client-Id based auth
     client_id: ClientIdAuth,
+    /// Optional trusted proxy X-Auth-* based auth
+    trusted_proxy_enabled: bool,
+    /// Optional Authorization: Bearer JWT auth
+    bearer: BearerAuth,
 }
 
 impl AuthConfig {
-    fn from_env_and_config(auth_cfg: &RootAuthConfig) -> Self {
+    async fn from_env_and_config(auth_cfg: &RootAuthConfig) -> Result<Self, ServerError> {
         let user = std::env::var("AUTH_USERNAME").ok();
         let pass = std::env::var("AUTH_PASSWORD").ok();
 
@@ -286,21 +524,30 @@ impl AuthConfig {
         };
 
         let client_id = ClientIdAuth::from_config(&auth_cfg.client_id);
+        if auth_cfg.trusted_proxy.enabled {
+            info!("[auth] trusted proxy X-Auth-* headers enabled");
+        } else {
+            info!("[auth] trusted proxy X-Auth-* headers disabled");
+        }
+        let bearer = BearerAuth::from_config(&auth_cfg.bearer).await?;
 
-        Self {
+        Ok(Self {
             required,
             username,
             password,
             client_id,
-        }
+            trusted_proxy_enabled: auth_cfg.trusted_proxy.enabled,
+            bearer,
+        })
     }
 }
 
 struct AppState {
-    http: HttpConfig,
+    server: ServerConfig,
     envs: HashMap<String, EnvState>,
     auth: AuthConfig,
     startup_time: chrono::DateTime<Utc>,
+    tenancy: TenancyConfig,
 }
 
 /// ---------- Errors ----------
@@ -343,6 +590,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("[main] Loading config from {}", cli.config.display());
 
     let root_cfg = load_root_config(&cli.config)?;
+    let server_cfg = resolve_server_config(&root_cfg)?;
 
     // Build global env map
     let mut global_env: HashMap<String, String> = HashMap::new();
@@ -357,11 +605,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         merge_env_file_into(env_file, &mut global_env);
     }
 
-    // Build environments map
+    // Build environments map (tenant/env)
     let mut envs: HashMap<String, EnvState> = HashMap::new();
 
-    if !root_cfg.environments.is_empty() {
-        // Multi-tenant
+    if !root_cfg.tenants.is_empty() {
+        for (tenant, tenant_def) in &root_cfg.tenants {
+            for (name, env_def) in &tenant_def.environments {
+                let mut env_map = global_env.clone();
+                if let Some(ref path) = env_def.env_file {
+                    merge_env_file_into(path, &mut env_map);
+                }
+
+                let mut git_cfg = env_def.git.clone();
+                git_cfg.normalize_branches();
+
+                envs.insert(
+                    env_key(tenant, name),
+                    EnvState {
+                        tenant: tenant.clone(),
+                        name: name.clone(),
+                        git: git_cfg,
+                        env_map: Arc::new(env_map),
+                    },
+                );
+            }
+        }
+    } else if !root_cfg.environments.is_empty() {
+        // Legacy multi-tenant: environments only (default tenant)
         for (name, env_def) in &root_cfg.environments {
             let mut env_map = global_env.clone();
             if let Some(ref path) = env_def.env_file {
@@ -372,8 +642,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             git_cfg.normalize_branches();
 
             envs.insert(
-                name.clone(),
+                env_key(&root_cfg.tenancy.default_tenant, name),
                 EnvState {
+                    tenant: root_cfg.tenancy.default_tenant.clone(),
                     name: name.clone(),
                     git: git_cfg,
                     env_map: Arc::new(env_map),
@@ -381,23 +652,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     } else if let Some(ref git) = root_cfg.git {
-        // Single-instance, exposed as logical env "default"
+        // Single-instance, exposed as logical env "default" under default tenant
         let mut git_cfg = git.clone();
         git_cfg.normalize_branches();
 
         envs.insert(
-            "default".to_string(),
+            env_key(&root_cfg.tenancy.default_tenant, "default"),
             EnvState {
+                tenant: root_cfg.tenancy.default_tenant.clone(),
                 name: "default".to_string(),
                 git: git_cfg,
                 env_map: Arc::new(global_env.clone()),
             },
         );
     } else {
-        return Err("config.yaml must contain either `git` or `environments`".into());
+        return Err("config.yaml must contain either `git`, `environments`, or `tenants`".into());
     }
 
-    let auth = AuthConfig::from_env_and_config(&root_cfg.auth);
+    let auth = AuthConfig::from_env_and_config(&root_cfg.auth).await?;
 
     // Initial sync for all envs
     for env in envs.values() {
@@ -413,15 +685,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state = Arc::new(AppState {
-        http: root_cfg.http.clone(),
+        server: server_cfg.clone(),
         envs,
         auth,
         startup_time: Utc::now(),
+        tenancy: root_cfg.tenancy.clone(),
     });
 
     let app = build_router(state.clone());
 
-    let addr: SocketAddr = state.http.bind_addr.parse()?;
+    let addr: SocketAddr = state.server.bind.parse()?;
     info!("[main] Listening on http://{}", addr);
 
     let listener = TcpListener::bind(addr).await?;
@@ -445,6 +718,25 @@ fn load_root_config(path: &Path) -> Result<RootConfig, ServerError> {
     let contents = std::fs::read_to_string(path)?;
     let cfg: RootConfig = serde_yaml_ng::from_str(&contents)?;
     Ok(cfg)
+}
+
+fn env_key(tenant: &str, env: &str) -> String {
+    format!("{tenant}/{env}")
+}
+
+fn resolve_server_config(cfg: &RootConfig) -> Result<ServerConfig, ServerError> {
+    if let Some(s) = &cfg.server {
+        return Ok(s.clone());
+    }
+    if let Some(h) = &cfg.http {
+        return Ok(ServerConfig {
+            bind: h.bind_addr.clone(),
+            base_path: h.base_path.clone(),
+        });
+    }
+    Err(ServerError::BadRequest(
+        "config.yaml must contain `server` or legacy `http`".to_string(),
+    ))
 }
 
 fn merge_env_file_into(path: &str, target: &mut HashMap<String, String>) {
@@ -834,43 +1126,55 @@ async fn read_and_merge_yaml_files(
     candidates.push(PathBuf::from("application.yml"));
     candidates.push(PathBuf::from("application.yaml"));
 
+    let search_roots = vec![PathBuf::new()];
+
     let mut property_sources: Vec<SpringPropertySource> = Vec::new();
     let mut found_any = false;
 
-    for rel in candidates {
-        if let Some(bytes) = read_file_from_git(git, label_opt, &rel).await? {
-            found_any = true;
+    for root in &search_roots {
+        for candidate in &candidates {
+            let rel = if root.as_os_str().is_empty() {
+                candidate.clone()
+            } else {
+                let mut p = root.clone();
+                p.push(candidate);
+                p
+            };
 
-            let content = String::from_utf8(bytes)?;
-            let templated = apply_template(&content, env_map);
-            let yaml: YamlValue = serde_yaml_ng::from_str(&templated)?;
+            if let Some(bytes) = read_file_from_git(git, label_opt, &rel).await? {
+                found_any = true;
 
-            // Zploštíme YAML do mapy key -> JsonValue pro *tento* soubor
-            let mut flat: IndexMap<String, JsonValue> = IndexMap::new();
-            flatten_yaml_value(None, &yaml, &mut flat);
+                let content = String::from_utf8(bytes)?;
+                let templated = apply_template(&content, env_map);
+                let yaml: YamlValue = serde_yaml_ng::from_str(&templated)?;
 
-            // Jméno property source ve stylu Springu:
-            // <repo_url>/<subpath>/<relativní_cesta_souboru>
-            let mut rel_with_subpath = PathBuf::new();
-            if let Some(sub) = &git.subpath {
-                rel_with_subpath.push(sub);
+                // Zploštíme YAML do mapy key -> JsonValue pro *tento* soubor
+                let mut flat: IndexMap<String, JsonValue> = IndexMap::new();
+                flatten_yaml_value(None, &yaml, &mut flat);
+
+                // Jméno property source ve stylu Springu:
+                // <repo_url>/<subpath>/<relativní_cesta_souboru>
+                let mut rel_with_subpath = PathBuf::new();
+                if let Some(sub) = &git.subpath {
+                    rel_with_subpath.push(sub);
+                }
+                rel_with_subpath.push(&rel);
+
+                let rel_str = rel_with_subpath
+                    .components()
+                    .fold(String::new(), |mut acc, c| {
+                        if !acc.is_empty() {
+                            acc.push('/');
+                        }
+                        acc.push_str(&c.as_os_str().to_string_lossy());
+                        acc
+                    });
+
+                let base = git.repo_url.trim_end_matches('/');
+                let name = format!("{}/{}", base, rel_str);
+
+                property_sources.push(SpringPropertySource { name, source: flat });
             }
-            rel_with_subpath.push(&rel);
-
-            let rel_str = rel_with_subpath
-                .components()
-                .fold(String::new(), |mut acc, c| {
-                    if !acc.is_empty() {
-                        acc.push('/');
-                    }
-                    acc.push_str(&c.as_os_str().to_string_lossy());
-                    acc
-                });
-
-            let base = git.repo_url.trim_end_matches('/');
-            let name = format!("{}/{}", base, rel_str);
-
-            property_sources.push(SpringPropertySource { name, source: flat });
         }
     }
 
@@ -973,7 +1277,50 @@ async fn handle_spring_request(
 enum AuthScope {
     Config,
     Files,
-    Env,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct JwtClaims {
+    sub: Option<String>,
+    iss: Option<String>,
+    aud: Option<serde_json::Value>,
+    exp: usize,
+    scope: Option<String>,
+    client_id: Option<String>,
+    email: Option<String>,
+    preferred_username: Option<String>,
+    groups: Option<JwtGroups>,
+    #[serde(rename = "kubernetes.io")]
+    kubernetes: Option<KubernetesClaims>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct KubernetesClaims {
+    namespace: Option<String>,
+    serviceaccount: Option<KubernetesServiceAccountClaims>,
+    pod: Option<KubernetesPodClaims>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct KubernetesServiceAccountClaims {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct KubernetesPodClaims {
+    name: Option<String>,
+    uid: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum JwtGroups {
+    One(String),
+    Many(Vec<String>),
 }
 
 /// Basic-auth check only (no fallback semantics)
@@ -1019,28 +1366,322 @@ fn client_has_env(client: &ClientIdClient, env: Option<&str>) -> bool {
     }
 }
 
+fn client_has_tenant(client: &ClientIdClient, tenant: Option<&str>) -> bool {
+    match tenant {
+        None => true,
+        Some(t) => {
+            if client.tenants.iter().any(|v| v == "*") {
+                true
+            } else {
+                client.tenants.iter().any(|v| v == t)
+            }
+        }
+    }
+}
+
 fn client_has_scope(client: &ClientIdClient, scope: AuthScope) -> bool {
     let needed = match scope {
         AuthScope::Config => "config:read",
         AuthScope::Files => "files:read",
-        AuthScope::Env => "env:read",
     };
     client.scopes.iter().any(|s| s == needed)
 }
 
-/// Combined authorization for basic + X-Client-Id
-fn is_authorized_for(
+fn jwt_groups_to_vec(groups: JwtGroups) -> Vec<String> {
+    match groups {
+        JwtGroups::One(value) => vec![value],
+        JwtGroups::Many(values) => values,
+    }
+}
+
+fn jwt_scopes_to_vec(scope: Option<&str>) -> Vec<String> {
+    scope
+        .unwrap_or("")
+        .split_whitespace()
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_kube_service_account_claims(claims: &JwtClaims) -> bool {
+    let Some(subject) = claims.sub.as_deref() else {
+        return false;
+    };
+    let Some(rest) = subject.strip_prefix("system:serviceaccount:") else {
+        return false;
+    };
+    let mut parts = rest.split(':');
+    let Some(subject_namespace) = parts.next().filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(subject_service_account) = parts.next().filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+
+    let namespace = claims
+        .kubernetes
+        .as_ref()
+        .and_then(|k| k.namespace.as_deref());
+    let service_account = claims
+        .kubernetes
+        .as_ref()
+        .and_then(|k| k.serviceaccount.as_ref())
+        .and_then(|sa| sa.name.as_deref());
+
+    namespace == Some(subject_namespace) && service_account == Some(subject_service_account)
+}
+
+fn claims_authorized(
+    issuer: &BearerIssuer,
+    claims: &JwtClaims,
+    tenant: Option<&str>,
+    env: Option<&str>,
+    scope: Option<AuthScope>,
+) -> bool {
+    if issuer.kind == BearerIssuerKind::KubeSaJwt && !validate_kube_service_account_claims(claims) {
+        return false;
+    }
+
+    let groups = claims
+        .groups
+        .clone()
+        .map(jwt_groups_to_vec)
+        .unwrap_or_default();
+    if groups
+        .iter()
+        .any(|group| group == "simple-config:role:admin")
+    {
+        return true;
+    }
+
+    let tenant_allowed =
+        tenant.is_none() || proxy_group_matches(&groups, "simple-config:tenant", tenant);
+    let env_allowed = env.is_none() || proxy_group_matches(&groups, "simple-config:env", env);
+    if !tenant_allowed || !env_allowed {
+        return false;
+    }
+
+    match scope {
+        None => groups.iter().any(|group| group == "simple-config:ui"),
+        Some(scope) => {
+            let needed = match scope {
+                AuthScope::Config => "config:read",
+                AuthScope::Files => "files:read",
+            };
+            let token_scopes = jwt_scopes_to_vec(claims.scope.as_deref());
+            groups
+                .iter()
+                .any(|group| group == &format!("simple-config:scope:{needed}") || group == needed)
+                || token_scopes.iter().any(|token_scope| token_scope == needed)
+        }
+    }
+}
+
+enum BearerAuthAttempt {
+    Allowed,
+    UnknownKid,
+    Invalid,
+}
+
+async fn try_bearer_auth(
+    auth: &BearerAuth,
+    token: &str,
+    header: &jsonwebtoken::Header,
+    kid: &str,
+    tenant: Option<&str>,
+    env: Option<&str>,
+    scope: Option<AuthScope>,
+) -> BearerAuthAttempt {
+    let issuers = auth.issuers.read().await;
+    let mut saw_kid = false;
+    for issuer in issuers.iter() {
+        let Some(key) = issuer.jwks.get(kid) else {
+            continue;
+        };
+        saw_kid = true;
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&[issuer.issuer.as_str()]);
+        if let Some(audience) = issuer.audience.as_ref() {
+            validation.set_audience(&[audience.as_str()]);
+        } else {
+            validation.validate_aud = false;
+        }
+
+        let decoded = match decode::<JwtClaims>(token, key, &validation) {
+            Ok(decoded) => decoded,
+            Err(_) => continue,
+        };
+        if claims_authorized(issuer, &decoded.claims, tenant, env, scope) {
+            return BearerAuthAttempt::Allowed;
+        }
+        return BearerAuthAttempt::Invalid;
+    }
+
+    if saw_kid {
+        BearerAuthAttempt::Invalid
+    } else {
+        BearerAuthAttempt::UnknownKid
+    }
+}
+
+async fn refresh_bearer_jwks(auth: &BearerAuth) -> bool {
+    let targets = {
+        let issuers = auth.issuers.read().await;
+        issuers
+            .iter()
+            .map(|issuer| (issuer.name.clone(), issuer.jwks_url.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut refreshed = Vec::new();
+    for (name, jwks_url) in targets {
+        if let Ok(jwks) = load_jwks(&jwks_url).await {
+            refreshed.push((name, jwks));
+        }
+    }
+    if refreshed.is_empty() {
+        return false;
+    }
+
+    let mut issuers = auth.issuers.write().await;
+    for (name, jwks) in refreshed {
+        if let Some(issuer) = issuers.iter_mut().find(|issuer| issuer.name == name) {
+            issuer.jwks = jwks;
+        }
+    }
+    true
+}
+
+async fn bearer_authorized(
+    auth: &BearerAuth,
+    headers: &HeaderMap,
+    tenant: Option<&str>,
+    env: Option<&str>,
+    scope: Option<AuthScope>,
+) -> bool {
+    if !auth.enabled {
+        return false;
+    }
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let header = match decode_header(token) {
+        Ok(header) => header,
+        Err(_) => return false,
+    };
+    let Some(kid) = header.kid.as_deref() else {
+        return false;
+    };
+
+    match try_bearer_auth(auth, token, &header, kid, tenant, env, scope).await {
+        BearerAuthAttempt::Allowed => true,
+        BearerAuthAttempt::Invalid => false,
+        BearerAuthAttempt::UnknownKid => {
+            refresh_bearer_jwks(auth).await
+                && matches!(
+                    try_bearer_auth(auth, token, &header, kid, tenant, env, scope).await,
+                    BearerAuthAttempt::Allowed
+                )
+        }
+    }
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn split_csv_header(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn proxy_group_matches(groups: &[String], prefix: &str, value: Option<&str>) -> bool {
+    groups.iter().any(|group| group == &format!("{prefix}:*"))
+        || value
+            .map(|value| {
+                groups
+                    .iter()
+                    .any(|group| group == &format!("{prefix}:{value}"))
+            })
+            .unwrap_or(false)
+}
+
+fn trusted_proxy_authorized(
+    headers: &HeaderMap,
+    tenant: Option<&str>,
+    env: Option<&str>,
+    scope: Option<AuthScope>,
+) -> bool {
+    let subject =
+        header_str(headers, "x-auth-subject").or_else(|| header_str(headers, "x-auth-user"));
+    if subject.is_none() {
+        return false;
+    }
+
+    let groups = header_str(headers, "x-auth-groups")
+        .map(split_csv_header)
+        .unwrap_or_default();
+    if groups
+        .iter()
+        .any(|group| group == "simple-config:role:admin")
+    {
+        return true;
+    }
+
+    let tenant_allowed =
+        tenant.is_none() || proxy_group_matches(&groups, "simple-config:tenant", tenant);
+    let env_allowed = env.is_none() || proxy_group_matches(&groups, "simple-config:env", env);
+    if !tenant_allowed || !env_allowed {
+        return false;
+    }
+
+    match scope {
+        None => groups.iter().any(|group| group == "simple-config:ui"),
+        Some(scope) => {
+            let needed = match scope {
+                AuthScope::Config => "config:read",
+                AuthScope::Files => "files:read",
+            };
+            groups
+                .iter()
+                .any(|group| group == &format!("simple-config:scope:{needed}") || group == needed)
+        }
+    }
+}
+
+/// Combined authorization for basic + X-Client-Id + trusted proxy headers
+async fn is_authorized_for(
     state: &AppState,
     headers: &HeaderMap,
+    tenant: Option<&str>,
     env: Option<&str>,
     scope: Option<AuthScope>,
 ) -> bool {
     let basic_enabled = state.auth.required;
     let client_auth = &state.auth.client_id;
     let client_enabled = client_auth.enabled;
+    let proxy_enabled = state.auth.trusted_proxy_enabled;
+    let bearer_enabled = state.auth.bearer.enabled;
 
     // No auth configured at all -> open access (backwards compatible)
-    if !basic_enabled && !client_enabled {
+    if !basic_enabled && !client_enabled && !proxy_enabled && !bearer_enabled {
         return true;
     }
 
@@ -1049,9 +1690,14 @@ fn is_authorized_for(
         return true;
     }
 
-    // 2) X-Client-Id
+    // 2) Bearer JWT
+    if bearer_authorized(&state.auth.bearer, headers, tenant, env, scope).await {
+        return true;
+    }
+
+    // 3) X-Client-Id
     if client_enabled && let Some(client) = client_auth.get_client(headers) {
-        if !client_has_env(client, env) {
+        if !client_has_tenant(client, tenant) || !client_has_env(client, env) {
             return false;
         }
 
@@ -1068,6 +1714,11 @@ fn is_authorized_for(
                 }
             }
         }
+    }
+
+    // 4) Trusted proxy X-Auth-* headers
+    if proxy_enabled && trusted_proxy_authorized(headers, tenant, env, scope) {
+        return true;
     }
 
     false
@@ -1097,22 +1748,47 @@ async fn spring_like_404(OriginalUri(uri): OriginalUri) -> Response {
     spring_not_found_json(uri.path())
 }
 
+fn env_state_or_404<'a>(
+    state: &'a AppState,
+    tenant: &str,
+    env: &str,
+    path_for_error: &str,
+) -> Result<&'a EnvState, Box<Response>> {
+    let key = env_key(tenant, env);
+    match state.envs.get(&key) {
+        Some(e) => Ok(e),
+        None => Err(Box::new(spring_not_found_json(path_for_error))),
+    }
+}
+
 /// ---------- HTTP handlers ----------
-async fn spring_handler(
+async fn spring_handler_tenant(
     State(state): State<Arc<AppState>>,
-    AxumPath((env, application, profile, label)): AxumPath<(String, String, String, String)>,
+    AxumPath((tenant, env, application, profile, label)): AxumPath<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Config)) {
+    if !is_authorized_for(
+        &state,
+        &headers,
+        Some(&tenant),
+        Some(&env),
+        Some(AuthScope::Config),
+    )
+    .await
+    {
         return unauthorized_response();
     }
 
-    let env_state = match state.envs.get(&env) {
-        Some(e) => e,
-        None => {
-            let path = format!("/{}/{}/{}/{}", env, application, profile, label);
-            return spring_not_found_json(&path);
-        }
+    let path = format!("/api/v1/tenants/{tenant}/envs/{env}/{application}/{profile}/{label}");
+    let env_state = match env_state_or_404(&state, &tenant, &env, &path) {
+        Ok(e) => e,
+        Err(r) => return *r,
     };
 
     match handle_spring_request(env_state, &application, &profile, Some(&label)).await {
@@ -1124,21 +1800,42 @@ async fn spring_handler(
     }
 }
 
-async fn spring_handler_no_label(
+// Legacy Spring-compatible route (default tenant)
+async fn spring_handler_legacy(
     State(state): State<Arc<AppState>>,
-    AxumPath((env, application, profile)): AxumPath<(String, String, String)>,
+    AxumPath((env, application, profile, label)): AxumPath<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Config)) {
+    let tenant = state.tenancy.default_tenant.clone();
+    spring_handler_tenant(
+        State(state),
+        AxumPath((tenant, env, application, profile, label)),
+        headers,
+    )
+    .await
+}
+
+async fn spring_handler_no_label_tenant(
+    State(state): State<Arc<AppState>>,
+    AxumPath((tenant, env, application, profile)): AxumPath<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authorized_for(
+        &state,
+        &headers,
+        Some(&tenant),
+        Some(&env),
+        Some(AuthScope::Config),
+    )
+    .await
+    {
         return unauthorized_response();
     }
 
-    let env_state = match state.envs.get(&env) {
-        Some(e) => e,
-        None => {
-            let path = format!("/{}/{}/{}", env, application, profile);
-            return spring_not_found_json(&path);
-        }
+    let path = format!("/api/v1/tenants/{tenant}/envs/{env}/{application}/{profile}");
+    let env_state = match env_state_or_404(&state, &tenant, &env, &path) {
+        Ok(e) => e,
+        Err(r) => return *r,
     };
 
     match handle_spring_request(env_state, &application, &profile, None).await {
@@ -1150,103 +1847,91 @@ async fn spring_handler_no_label(
     }
 }
 
-fn shell_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-}
-
-async fn env_json_handler(
+// Legacy Spring-compatible route (default tenant, no label)
+async fn spring_handler_no_label_legacy(
     State(state): State<Arc<AppState>>,
-    AxumPath(env): AxumPath<String>,
+    AxumPath((env, application, profile)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Env)) {
+    let tenant = state.tenancy.default_tenant.clone();
+    spring_handler_no_label_tenant(
+        State(state),
+        AxumPath((tenant, env, application, profile)),
+        headers,
+    )
+    .await
+}
+
+async fn env_files_handler_tenant(
+    State(state): State<Arc<AppState>>,
+    AxumPath((tenant, env)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authorized_for(
+        &state,
+        &headers,
+        Some(&tenant),
+        Some(&env),
+        Some(AuthScope::Files),
+    )
+    .await
+    {
         return unauthorized_response();
     }
 
-    let env_state = match state.envs.get(&env) {
-        Some(e) => e,
-        None => {
-            let path = format!("/{}/env", env);
-            return spring_not_found_json(&path);
-        }
-    };
-
-    Json(&*env_state.env_map).into_response()
-}
-
-async fn env_export_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(env): AxumPath<String>,
-    headers: HeaderMap,
-) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Env)) {
-        return unauthorized_response();
-    }
-
-    let env_state = match state.envs.get(&env) {
-        Some(e) => e,
-        None => {
-            let path = format!("/{}/env/export", env);
-            return spring_not_found_json(&path);
-        }
-    };
-
-    let mut body = String::new();
-    for (k, v) in env_state.env_map.iter() {
-        body.push_str("export ");
-        body.push_str(k);
-        body.push_str("=\"");
-        body.push_str(&shell_escape(v));
-        body.push_str("\"\n");
-    }
-
-    let mut resp = Response::new(body.into());
-    resp.headers_mut()
-        .insert(CONTENT_TYPE, "text/plain; charset=utf-8".parse().unwrap());
-    resp
-}
-
-async fn env_files_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(env): AxumPath<String>,
-    headers: HeaderMap,
-) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Files)) {
-        return unauthorized_response();
-    }
-
-    let env_state = match state.envs.get(&env) {
-        Some(e) => e,
-        None => {
-            let path = format!("/{}/assets", env);
-            return spring_not_found_json(&path);
-        }
+    let path = format!("/api/v1/tenants/{tenant}/envs/{env}/assets");
+    let env_state = match env_state_or_404(&state, &tenant, &env, &path) {
+        Ok(e) => e,
+        Err(r) => return *r,
     };
 
     match list_files_in_git(&env_state.git).await {
-        Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
+        Ok(files) => {
+            let items: Vec<AssetListItem> = files.iter().cloned().map(asset_list_item).collect();
+            Json(serde_json::json!({ "files": files, "items": items })).into_response()
+        }
         Err(e) => {
-            error!("[files] error: {:?}", e);
+            error!("[assets] list_files_in_git failed: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
         }
     }
 }
 
-async fn env_file_handler(
+// Legacy assets list route (default tenant)
+async fn env_files_handler_legacy(
     State(state): State<Arc<AppState>>,
-    AxumPath((env, rel_path)): AxumPath<(String, String)>,
+    AxumPath(env): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authorized_for(&state, &headers, Some(&env), Some(AuthScope::Files)) {
+    let tenant = state.tenancy.default_tenant.clone();
+    env_files_handler_tenant(State(state), AxumPath((tenant, env)), headers).await
+}
+
+async fn env_file_handler_tenant(
+    State(state): State<Arc<AppState>>,
+    AxumPath((tenant, env, rel_path)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authorized_for(
+        &state,
+        &headers,
+        Some(&tenant),
+        Some(&env),
+        Some(AuthScope::Files),
+    )
+    .await
+    {
         return unauthorized_response();
     }
 
-    let env_state = match state.envs.get(&env) {
-        Some(e) => e,
-        None => return (StatusCode::NOT_FOUND, "Environment not found").into_response(),
+    let env_state = match env_state_or_404(
+        &state,
+        &tenant,
+        &env,
+        &format!("/api/v1/tenants/{tenant}/envs/{env}/assets/{rel_path}"),
+    ) {
+        Ok(e) => e,
+        Err(r) => return *r,
     };
 
     // Normalize (just in case)
@@ -1256,18 +1941,12 @@ async fn env_file_handler(
     }
 
     let res = if let Some((first, rest)) = rel_path.split_once('/') {
-        // Ambiguous case:
-        // - could be "{label}/{path...}"
-        // - or could be nested path in default branch ("src/Makefile")
-        //
-        // Try label first; if it doesn't exist -> fallback to default branch with full rel_path.
         match handle_file_request(env_state, Some(first), rest).await {
             Ok(resp) => Ok(resp),
             Err(ServerError::NotFound) => handle_file_request(env_state, None, &rel_path).await,
             Err(e) => Err(e),
         }
     } else {
-        // Single segment path -> default branch
         handle_file_request(env_state, None, &rel_path).await
     };
 
@@ -1281,6 +1960,15 @@ async fn env_file_handler(
     }
 }
 
+// Legacy asset file route (default tenant)
+async fn env_file_handler_legacy(
+    State(state): State<Arc<AppState>>,
+    AxumPath((env, rel_path)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let tenant = state.tenancy.default_tenant.clone();
+    env_file_handler_tenant(State(state), AxumPath((tenant, env, rel_path)), headers).await
+}
 async fn handle_file_request(
     env_state: &EnvState,
     label: Option<&str>,
@@ -1294,6 +1982,11 @@ async fn handle_file_request(
     };
 
     let is_binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+    let is_opaque_asset_bundle = safe_rel
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| name == "assets.secured.json" || name == "assets.unsecured.json")
+        .unwrap_or(false);
 
     if is_binary {
         let mime = MimeGuess::from_path(&safe_rel)
@@ -1308,11 +2001,19 @@ async fn handle_file_request(
         Ok(resp)
     } else {
         let text = String::from_utf8(bytes)?;
-        let templated = apply_template(&text, &env_state.env_map);
-        let mime = MimeGuess::from_path(&safe_rel)
-            .first_or_octet_stream()
-            .to_string();
-        let mut resp = Response::new(templated.into());
+        let body = if is_opaque_asset_bundle {
+            text
+        } else {
+            apply_template(&text, &env_state.env_map)
+        };
+        let mime = if is_opaque_asset_bundle {
+            "application/json".to_string()
+        } else {
+            MimeGuess::from_path(&safe_rel)
+                .first_or_octet_stream()
+                .to_string()
+        };
+        let mut resp = Response::new(body.into());
         resp.headers_mut().insert(
             CONTENT_TYPE,
             mime.parse()
@@ -1352,6 +2053,37 @@ struct EnvHealthList {
     status: &'static str,
     startup_time: String,
     environments: Vec<EnvHealthSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AssetListItem {
+    path: String,
+    kind: &'static str,
+    opaque: bool,
+    templated: bool,
+}
+
+fn asset_list_item(path: String) -> AssetListItem {
+    match path.as_str() {
+        "assets.secured.json" => AssetListItem {
+            path,
+            kind: "assets-secured-bundle",
+            opaque: true,
+            templated: false,
+        },
+        "assets.unsecured.json" => AssetListItem {
+            path,
+            kind: "assets-unsecured-bundle",
+            opaque: true,
+            templated: false,
+        },
+        _ => AssetListItem {
+            path,
+            kind: "file",
+            opaque: false,
+            templated: true,
+        },
+    }
 }
 
 /// Count regular files in the working tree for the given environment (excluding .git).
@@ -1407,7 +2139,7 @@ async fn healthz_env_all_handler(State(state): State<Arc<AppState>>) -> impl Int
     let mut envs_vec = Vec::new();
     for env_state in state.envs.values() {
         envs_vec.push(EnvHealthSummary {
-            env: env_state.name.clone(),
+            env: format!("{}/{}", env_state.tenant, env_state.name),
             env_var_count: env_state.env_map.len(),
             file_count: count_files_for_env(env_state),
         });
@@ -1422,15 +2154,18 @@ async fn healthz_env_all_handler(State(state): State<Arc<AppState>>) -> impl Int
     (StatusCode::OK, Json(body))
 }
 
-async fn healthz_env_single_handler(
+async fn healthz_env_single_handler_tenant(
     State(state): State<Arc<AppState>>,
-    AxumPath(env): AxumPath<String>,
+    AxumPath((tenant, env)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
-    let env_state = match state.envs.get(&env) {
-        Some(e) => e,
-        None => {
-            return StatusCode::NOT_FOUND.into_response();
-        }
+    let env_state = match env_state_or_404(
+        &state,
+        &tenant,
+        &env,
+        &format!("/api/v1/tenants/{tenant}/envs/{env}/healthz"),
+    ) {
+        Ok(e) => e,
+        Err(r) => return *r,
     };
 
     let ts = state
@@ -1449,13 +2184,15 @@ async fn healthz_env_single_handler(
 }
 
 async fn ui_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !is_authorized_for(&state, &headers, None, None) {
+    if !is_authorized_for(&state, &headers, None, None, None).await {
         return unauthorized_response();
     }
 
     #[derive(Serialize)]
     struct EnvMeta {
+        tenant: String,
         name: String,
+        api_base: String,
         repo_url: String,
         branch: String,
         workdir: String,
@@ -1471,6 +2208,7 @@ async fn ui_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         auth_enabled: bool,
     }
 
+    let base_path = normalize_base_path(&state.server.base_path);
     let mut envs_meta = Vec::new();
     for env_state in state.envs.values() {
         let last_commit = match git_version_for_label(&env_state.git, None).await {
@@ -1494,8 +2232,22 @@ async fn ui_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             }
         };
 
+        let api_base = if base_path == "/" {
+            format!(
+                "/api/v1/tenants/{}/envs/{}",
+                env_state.tenant, env_state.name
+            )
+        } else {
+            format!(
+                "{}/api/v1/tenants/{}/envs/{}",
+                base_path, env_state.tenant, env_state.name
+            )
+        };
+
         envs_meta.push(EnvMeta {
+            tenant: env_state.tenant.clone(),
             name: env_state.name.clone(),
+            api_base,
             repo_url: env_state.git.repo_url.clone(),
             branch: env_state.git.branch.clone(),
             workdir: env_state.git.workdir.display().to_string(),
@@ -1511,7 +2263,7 @@ async fn ui_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     }
 
     let meta = UiMeta {
-        base_path: normalize_base_path(&state.http.base_path),
+        base_path,
         environments: envs_meta,
         auth_enabled: state.auth.required || state.auth.client_id.enabled,
     };
@@ -1529,35 +2281,58 @@ async fn ui_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    let base_path = normalize_base_path(&state.http.base_path);
+    let base_path = normalize_base_path(&state.server.base_path);
 
     let inner = Router::new()
         // Health endpoints (no auth, good for k8s probes)
         .route("/healthz", get(healthz_handler))
         .route("/helthz", get(healthz_handler)) // alias for typo-friendly access
         .route("/healthz/env", get(healthz_env_all_handler))
-        .route("/healthz/env/{env}", get(healthz_env_single_handler))
+        .route(
+            "/api/v1/tenants/{tenant}/envs/{env}/healthz",
+            get(healthz_env_single_handler_tenant),
+        )
         // Asset listing & raw asset access with templating for non-Spring clients
-        .route("/{env}/assets", get(env_files_handler))
-        // Assets endpoint supports both:
-        //   /{env}/assets/{path}              -> default branch
-        //   /{env}/assets/{label}/{path...}   -> explicit git label (branch/tag)
-        .route("/{env}/assets/{*path}", get(env_file_handler))
-        // Spring-compatible: /{env}/{application}/{profile}/{label}
         .route(
-            "/{env}/{application}/{profile}/{label}",
-            get(spring_handler),
+            "/api/v1/tenants/{tenant}/envs/{env}/assets",
+            get(env_files_handler_tenant),
         )
-        // Spring-compatible: /{env}/{application}/{profile}
         .route(
-            "/{env}/{application}/{profile}",
-            get(spring_handler_no_label),
+            "/api/v1/tenants/{tenant}/envs/{env}/assets/{*path}",
+            get(env_file_handler_tenant),
         )
-        // Env helpers
-        .route("/{env}/env", get(env_json_handler))
-        .route("/{env}/env/export", get(env_export_handler))
+        // Spring-compatible (tenant-aware)
+        .route(
+            "/api/v1/tenants/{tenant}/envs/{env}/{application}/{profile}/{label}",
+            get(spring_handler_tenant),
+        )
+        .route(
+            "/api/v1/tenants/{tenant}/envs/{env}/{application}/{profile}",
+            get(spring_handler_no_label_tenant),
+        )
         // UI
         .route("/ui", get(ui_handler));
+
+    let inner = if state.tenancy.mode == "simple" {
+        inner
+            // Legacy Spring-compatible routes (default tenant)
+            .route(
+                "/{env}/{application}/{profile}/{label}",
+                get(spring_handler_legacy),
+            )
+            .route(
+                "/{env}/{application}/{profile}",
+                get(spring_handler_no_label_legacy),
+            )
+            // Short API (default tenant)
+            .route("/api/v1/envs/{env}/assets", get(env_files_handler_legacy))
+            .route(
+                "/api/v1/envs/{env}/assets/{*path}",
+                get(env_file_handler_legacy),
+            )
+    } else {
+        inner
+    };
 
     let app = if base_path == "/" {
         inner

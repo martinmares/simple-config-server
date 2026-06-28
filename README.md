@@ -6,7 +6,7 @@ A small Rust service that behaves like a **read‑only Spring Cloud Config Serve
 * templating of text files using environment variables (`{{ VAR_NAME }}`),
 * lightweight HTML UI for inspection and debugging,
 * optional **HTTP Basic Auth** and **`X-Client-Id` header based auth**,
-* additional endpoints for non‑Spring clients (env JSON/export + raw assets).
+* additional endpoints for non‑Spring clients (raw assets).
 
 It is designed to run inside Kubernetes, but works equally well as a simple binary on your laptop.
 
@@ -34,6 +34,13 @@ You can run it in two modes:
 * **Single‑instance**: one Git config for everything (`git` at the root of `config.yaml`).
 * **Multi‑tenant**: multiple environments under `environments:` in `config.yaml`.
 
+### 1.1 Runtime env contract
+
+`simple-config-server` reads **final `.env` files**.
+
+- Decryption (`env.secured.json` -> dotenv) is out of scope for this service and should be done by initContainer/job/pipeline before startup.
+- Recommended production setting is `env_from_process: false` for deterministic behavior.
+
 ---
 
 ## 2. Configuration (`config.yaml`)
@@ -41,8 +48,8 @@ You can run it in two modes:
 ### 2.1 Root structure
 
 ```yaml
-http:
-  bind_addr: "127.0.0.1:8899"
+server:
+  bind: "0.0.0.0:8181"
   base_path: "/config"   # optional prefix for all routes
 
 # optional global env sources
@@ -63,7 +70,7 @@ auth:
       - id: "ops"
         description: "Ops dashboards"
         environments: ["*"]
-        scopes: ["config:read", "files:read", "env:read"]
+        scopes: ["config:read", "files:read"]
         ui_access: true
 
 # Either single-instance:
@@ -137,21 +144,21 @@ For an environment `env`, application `app`, profile `profile`, and optional git
 * Default label (uses `git.branch`):
 
   ```text
-  GET /{env}/{app}/{profile}
+  GET /api/v1/tenants/{tenant}/envs/{env}/{app}/{profile}
   ```
 
 * Explicit label (branch / tag / commit-ish):
 
   ```text
-  GET /{env}/{app}/{profile}/{label}
+  GET /api/v1/tenants/{tenant}/envs/{env}/{app}/{profile}/{label}
   ```
 
 Example:
 
 ```bash
-curl -u myuser:mypassword   "http://localhost:8899/dev/config-client/default"
+curl -u myuser:mypassword   "http://localhost:8181/api/v1/tenants/default/envs/dev/config-client/default"
 
-curl -u myuser:mypassword   "http://localhost:8899/dev/config-client/default/release"
+curl -u myuser:mypassword   "http://localhost:8181/api/v1/tenants/default/envs/dev/config-client/default/release"
 ```
 
 ### 3.2 YAML resolution & merge order
@@ -216,54 +223,18 @@ Flattening uses an [`IndexMap`](https://docs.rs/indexmap/) under the hood, so ke
 
 ---
 
-## 4. Extra endpoints for non‑Spring clients (env + assets)
+## 4. Extra endpoints for non‑Spring clients (assets)
 
-In addition to the Spring‑compatible endpoints, each environment exposes helpers for **env inspection** and **raw assets**.
+In addition to the Spring‑compatible endpoints, each environment exposes helpers for **raw assets**.
 
 Again, all routes are prefixed by `base_path` if configured.
 
-### 4.1 Env map endpoints
-
-For environment `{env}`:
-
-* Effective env as JSON:
-
-  ```text
-  GET /{env}/env
-  ```
-
-  Response:
-
-  ```json
-  {
-    "DB_URL": "jdbc:postgresql://localhost:5432/app-dev",
-    "DB_USER": "demo_user",
-    "DB_PASSWORD": "s3cr3t",
-    "ENV_NAME": "local-dev"
-  }
-  ```
-
-* Env as shell exports:
-
-  ```text
-  GET /{env}/env/export
-  ```
-
-  Response (plain text):
-
-  ```bash
-  export DB_URL="jdbc:postgresql://localhost:5432/app-dev"
-  export DB_USER="demo_user"
-  export DB_PASSWORD="s3cr3t"
-  export ENV_NAME="local-dev"
-  ```
-
-### 4.2 Asset endpoints
+### 4.1 Asset endpoints
 
 * List all files (relative to `git.subpath`) from the default branch:
 
   ```text
-  GET /{env}/assets
+  GET /api/v1/tenants/{tenant}/envs/{env}/assets
   ```
 
   Response:
@@ -274,6 +245,20 @@ For environment `{env}`:
       "application.yml",
       "config-client.yml",
       "user-management.yml"
+    ],
+    "items": [
+      {
+        "path": "application.yml",
+        "kind": "file",
+        "opaque": false,
+        "templated": true
+      },
+      {
+        "path": "assets.secured.json",
+        "kind": "assets-secured-bundle",
+        "opaque": true,
+        "templated": false
+      }
     ]
   }
   ```
@@ -281,26 +266,33 @@ For environment `{env}`:
 * Get a single asset from the **default** label:
 
   ```text
-  GET /{env}/assets/{path}
+  GET /api/v1/tenants/{tenant}/envs/{env}/assets/{path}
   ```
 
   Example:
 
   ```bash
-  curl -u myuser:mypassword     "http://localhost:8899/test/assets/application.yml"
+curl -u myuser:mypassword     "http://localhost:8181/api/v1/tenants/default/envs/test/assets/application.yml"
   ```
 
 * Get a single asset from an explicit label (branch / tag):
 
   ```text
-  GET /{env}/assets/{label}/{path}
+  GET /api/v1/tenants/{tenant}/envs/{env}/assets/{label}/{path}
   ```
 
   Example:
 
   ```bash
-  curl -u myuser:mypassword     "http://localhost:8899/test/assets/release/application.yml"
+curl -u myuser:mypassword     "http://localhost:8181/api/v1/tenants/default/envs/test/assets/release/application.yml"
   ```
+
+Notes:
+
+- text assets are template-expanded using the effective env map
+- `assets.secured.json` and `assets.unsecured.json` are served as opaque JSON payloads without template expansion
+- this allows clients or initContainers to download encrypted asset bundles and process them locally with `encjson-rs`
+- the UI marks these files as `virtual fs` bundles to distinguish them from regular text assets
 
 Semantics:
 
@@ -373,41 +365,46 @@ After YAML parsing, `maximumPoolSize` will be a number, not a string.
 `http` section:
 
 ```yaml
-http:
-  bind_addr: "127.0.0.1:8899"
+server:
+  bind: "0.0.0.0:8181"
   base_path: "/config"
 ```
 
-* `bind_addr` – address and port to bind, e.g. `0.0.0.0:8080`.
+Tenancy:
+
+```yaml
+tenancy:
+  mode: "simple"   # simple | multi
+  default_tenant: "default"
+```
+
+* `bind` – address and port to bind, e.g. `0.0.0.0:8080`.
 * `base_path` – optional prefix. If set to `/config`, all routes are available under that prefix:
 
   * Spring:
-    * `/config/{env}/{application}/{profile}`
-    * `/config/{env}/{application}/{profile}/{label}`
-  * Env helpers:
-    * `/config/{env}/env`
-    * `/config/{env}/env/export`
+    * `/config/api/v1/tenants/{tenant}/envs/{env}/{application}/{profile}`
+    * `/config/api/v1/tenants/{tenant}/envs/{env}/{application}/{profile}/{label}`
   * Asset helpers:
-    * `/config/{env}/assets`
-    * `/config/{env}/assets/{path}`
-    * `/config/{env}/assets/{label}/{path}`
+    * `/config/api/v1/tenants/{tenant}/envs/{env}/assets`
+    * `/config/api/v1/tenants/{tenant}/envs/{env}/assets/{path}`
+    * `/config/api/v1/tenants/{tenant}/envs/{env}/assets/{label}/{path}`
   * Health:
     * `/config/healthz`
     * `/config/healthz/env`
-    * `/config/healthz/env/{env}`
   * UI:
     * `/config/ui`
 
-If `base_path` is `/`, routes are exposed exactly as `/dev/env`, `/dev/assets`, `/dev/app/default`, etc.
+If `base_path` is `/`, routes are exposed exactly as `/api/v1/tenants/{tenant}/envs/{env}/assets`, `/api/v1/tenants/{tenant}/envs/{env}/{application}/{profile}`, etc.
 
 ### 6.2 Authentication
 
-There are two ways to protect the server:
+There are three ways to protect the server:
 
 1. **HTTP Basic Auth** via environment variables.
 2. **Header‑based client auth** via `X-Client-Id` (or a custom header) configured in `config.yaml`.
+3. **Trusted proxy headers** via `X-Auth-*` headers from a protected auth proxy.
 
-You can turn on either, both, or neither.
+You can turn on any combination, or none.
 
 #### 6.2.1 Basic Auth (env vars)
 
@@ -447,7 +444,7 @@ auth:
         ui_access: false
       - id: "ops-dashboard"
         environments: ["*"]
-        scopes: ["config:read", "files:read", "env:read"]
+        scopes: ["config:read", "files:read"]
         ui_access: true
 ```
 
@@ -462,22 +459,94 @@ Semantics:
       * `["*"]` → any environment.
       * otherwise → only listed environment names.
     * `scopes` control what the client can do:
-      * `config:read` – Spring‑style endpoints (`/{env}/{app}/{profile}…`).
-      * `files:read` – asset endpoints (`/{env}/assets…`).
-      * `env:read` – env endpoints (`/{env}/env`, `/env/export`).
+      * `config:read` – Spring‑style endpoints (`/api/v1/tenants/{tenant}/envs/{env}/{app}/{profile}…`).
+      * `files:read` – asset endpoints (`/api/v1/tenants/{tenant}/envs/{env}/assets…`).
     * `ui_access: true` additionally allows access to `/ui`.
   * If the header is missing or the client is not known, the request is rejected (unless Basic Auth already succeeded or all auth is disabled).
 
-#### 6.2.3 Auth precedence & defaults
+#### 6.2.3 Trusted proxy headers
+
+Use this mode only when the server is reachable exclusively through a trusted
+reverse proxy that strips all client-supplied `X-Auth-*` headers before setting
+trusted values.
+
+```yaml
+auth:
+  trusted_proxy:
+    enabled: true
+```
+
+Accepted headers:
+
+```http
+X-Auth-Subject: 97173b5f-6277-4aa7-b15e-a6c0b03cf0fd
+X-Auth-User: mares
+X-Auth-Email: mares@example.com
+X-Auth-Groups: simple-config:tenant:default,simple-config:env:test,simple-config:scope:config:read
+```
+
+Supported group conventions:
+
+* `simple-config:role:admin` – full access.
+* `simple-config:tenant:<tenant>` or `simple-config:tenant:*`.
+* `simple-config:env:<env>` or `simple-config:env:*`.
+* `simple-config:scope:config:read` for Spring-style config endpoints.
+* `simple-config:scope:files:read` for asset endpoints.
+* `simple-config:ui` for `/ui` access.
+
+#### 6.2.4 Bearer JWT auth
+
+Use this mode for CLI, CI/CD, service-to-service clients, and Kubernetes /
+OpenShift workloads.
+
+```yaml
+auth:
+  bearer:
+    enabled: true
+    issuers:
+      - name: "simple-idm-jwt"
+        kind: "simple-idm-jwt"
+        issuer: "https://sso.cloud-app.cz"
+        jwks_url: "https://sso.cloud-app.cz/.well-known/jwks.json"
+        audience: "simple-config-server"
+
+      - name: "kube-sa-jwt"
+        kind: "kube-sa-jwt"
+        issuer: "https://openshift.example.com"
+        discovery_url: "https://openshift.example.com/.well-known/openid-configuration"
+        audience: "simple-config-server"
+```
+
+If `jwks_url` is omitted, the server uses `discovery_url`. If both are omitted,
+it tries `{issuer}/.well-known/openid-configuration`.
+
+The same group conventions as trusted proxy headers are supported:
+
+* `simple-config:role:admin`
+* `simple-config:tenant:<tenant>` / `simple-config:tenant:*`
+* `simple-config:env:<env>` / `simple-config:env:*`
+* `simple-config:scope:config:read`
+* `simple-config:scope:files:read`
+* `simple-config:ui`
+
+OAuth scopes `config:read` and `files:read` are also accepted for API reads
+when tenant and environment access is granted through groups.
+
+For `kube-sa-jwt`, the server validates that the JWT `sub` matches the
+Kubernetes `namespace` and `serviceaccount.name` claims.
+
+#### 6.2.5 Auth precedence & defaults
 
 The authorization logic is:
 
-1. If **neither** Basic Auth nor X‑Client‑Id are configured → **open access** (backwards compatible).
+1. If **no auth mode** is configured → **open access** (backwards compatible).
 2. If Basic Auth is configured and the request has **valid** Basic credentials → **allow**, ignore X‑Client‑Id.
-3. Otherwise, if X‑Client‑Id auth is enabled and the header matches a configured client → check **environment** and **scopes**.
-4. Otherwise → **401 Unauthorized**.
+3. Otherwise, if Bearer JWT auth is enabled and the token grants access → **allow**.
+4. Otherwise, if X‑Client‑Id auth is enabled and the header matches a configured client → check **environment** and **scopes**.
+5. Otherwise, if trusted proxy headers are enabled and `X-Auth-*` grants access → **allow**.
+6. Otherwise → **401 Unauthorized**.
 
-Health endpoints (`/healthz`, `/healthz/env`, `/healthz/env/{env}`) are intentionally **not** protected and always return basic status information.
+Health endpoints (`/healthz`, `/healthz/env`) are intentionally **not** protected and always return basic status information.
 
 ---
 
@@ -497,14 +566,11 @@ It shows:
   * Workdir
   * Last commit hash
   * Commit date
-* effective env map:
-  * as JSON,
-  * as shell exports.
 * a tree of **assets** (files) under the Git subpath:
-  * click a file to see the **templated** content,
-  * or trigger a **Spring config JSON preview** (simulates `/env/app/default` and shows the merged JSON).
+  * click a file to see the preview,
+  * or trigger a **Spring config JSON preview** (simulates `/api/v1/tenants/{tenant}/envs/{env}/app/default` and shows the merged JSON).
 
-All main text areas (env JSON, shell exports, templated preview, Spring JSON preview) have “copy to clipboard” icons.
+The main preview areas have “copy to clipboard” icons.
 
 Authentication:
 
@@ -564,7 +630,7 @@ Health endpoints are useful for Kubernetes liveness/readiness probes and basic m
 * Detail for a single environment:
 
   ```text
-  GET /healthz/env/{env}
+  GET /api/v1/tenants/{tenant}/envs/{env}/healthz
   ```
 
   Response:
@@ -583,31 +649,39 @@ All of the above are also available under `${base_path}` if configured (e.g. `/c
 
 ---
 
-## 9. Example Git layout
+## 9. Example `config/assets` Git layout
 
-A typical mono‑repo layout for multi‑tenant usage:
+A typical multi-environment runtime config/assets repo:
 
 ```text
 <git_repo_root>/
   dev/
     application.yml
-    config-client.yml
-    user-management.yml
+    apps/
+      config-client.yml
+      user-management.yml
+    files/
+      nginx/nginx.conf
+      vector/vector.yaml
+      scripts/start.sh
+    secrets/
+      assets.secured.json
   test/
     application.yml
-    config-client.yml
-    user-management.yml
+    apps/
+      config-client.yml
+      user-management.yml
+    files/
+      nginx/nginx.conf
+      vector/vector.yaml
   ref/
     application.yml
-    config-client.yml
-    user-management.yml
   prod/
     application.yml
-    config-client.yml
-    user-management.yml
 ```
 
-Each environment in `config.yaml` would then point `git.subpath` to the corresponding subdirectory (`"dev"`, `"test"`, …).
+Each environment in `config.yaml` points `git.subpath` to the corresponding subdirectory (`"dev"`, `"test"`, …).
+Spring-compatible lookup still reads YAML files relative to that subpath. Raw asset endpoints expose the whole tree below it.
 
 ---
 
@@ -625,7 +699,7 @@ java -jar configclient.jar   --spring.profiles.active=dev   --spring.config.impo
 ```
 
 * The `/dev` segment selects the environment.
-* Spring will first request `/dev/<app>/default`, then `/dev/<app>/dev`, etc.
+* Spring will first request `/api/v1/tenants/default/envs/dev/<app>/default`, then `/api/v1/tenants/default/envs/dev/<app>/dev`, etc.
 * `simple-config-server` responds with the same JSON structure as the official Spring Cloud Config Server, including:
   * `name`
   * `profiles`
@@ -642,5 +716,3 @@ AGPLv3 License - see [LICENSE](LICENSE) file for details
 ## Author
 
 Martin Mareš
-
-
